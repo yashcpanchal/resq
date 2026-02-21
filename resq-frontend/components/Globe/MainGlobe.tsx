@@ -1,19 +1,28 @@
 "use client";
 
 import dynamic from "next/dynamic";
-import { useEffect, useState, useCallback, useRef } from "react";
+import { useEffect, useState, useCallback, useRef, useMemo } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { feature } from "topojson-client";
 import type { Topology, GeometryCollection } from "topojson-specification";
 import type { FeatureCollection, Feature, Geometry } from "geojson";
+import { geoCentroid } from "d3-geo";
 import { fetchFundingScores } from "@/lib/api";
 import { scoreToColor, scoreToSideColor } from "@/lib/utils";
+import { m49ToIso3, iso3ToM49 } from "@/lib/countryCodeMap";
 
 // react-globe.gl must be client-only (uses WebGL / window)
 const Globe = dynamic(() => import("react-globe.gl"), { ssr: false });
 
 const WORLD_TOPO_URL =
     "https://cdn.jsdelivr.net/npm/world-atlas@2/countries-110m.json";
+
+/** Default camera altitude (fully zoomed out). */
+const DEFAULT_ALTITUDE = 2.5;
+/** Camera altitude when focused on a country. */
+const FOCUS_ALTITUDE = 1.6;
+/** Transition duration in ms for the rotate/zoom animation. */
+const TRANSITION_MS = 1000;
 
 interface CountryFeature extends Feature<Geometry> {
     properties: {
@@ -24,18 +33,29 @@ interface CountryFeature extends Feature<Geometry> {
     };
 }
 
+interface GlobeInstance {
+    controls: () => { autoRotate: boolean; autoRotateSpeed: number };
+    pointOfView: (
+        pov: { lat?: number; lng?: number; altitude?: number },
+        transitionMs?: number
+    ) => void;
+}
+
 interface MainGlobeProps {
+    focusCountryCode?: string | null;
     onCountryClick?: (country: CountryFeature, score: number) => void;
     onCountryHover?: (country: CountryFeature | null) => void;
 }
 
 export default function MainGlobe({
+    focusCountryCode,
     onCountryClick,
     onCountryHover,
 }: MainGlobeProps) {
-    const globeRef = useRef<unknown>(null);
+    const globeRef = useRef<GlobeInstance | undefined>(undefined);
     const [countries, setCountries] = useState<CountryFeature[]>([]);
     const [dimensions, setDimensions] = useState({ width: 0, height: 0 });
+    const [selectedIso, setSelectedIso] = useState<string | null>(null);
 
     const { data: scores = {} } = useQuery({
         queryKey: ["funding-scores"],
@@ -64,52 +84,125 @@ export default function MainGlobe({
         return () => window.removeEventListener("resize", update);
     }, []);
 
-    // Auto-rotate
-    useEffect(() => {
-        const gl = globeRef.current as {
-            controls: () => { autoRotate: boolean; autoRotateSpeed: number };
-        } | null;
-        if (gl?.controls) {
-            const controls = gl.controls();
-            controls.autoRotate = true;
-            controls.autoRotateSpeed = 0.4;
-        }
-    }, [countries]);
 
-    const getIso = (feat: CountryFeature): string => {
-        return (
-            feat.properties?.iso_a3 ||
-            feat.properties?.ISO_A3 ||
-            feat.properties?.ISO_A3_EH ||
-            (feat.id as string) ||
-            ""
-        );
-    };
+    // ---- Helpers ---- //
+
+    const getIso = useCallback((feat: CountryFeature): string => {
+        const numericId =
+            typeof feat.id === "number"
+                ? String(feat.id).padStart(3, "0")
+                : String(feat.id ?? "");
+        return m49ToIso3[numericId] ?? numericId;
+    }, []);
 
     const getScore = useCallback(
         (feat: CountryFeature): number => {
             const iso = getIso(feat);
-            return scores[iso] ?? -1; // -1 = no data
+            return scores[iso] ?? -1;
         },
-        [scores]
+        [scores, getIso]
     );
+
+    // ---- Focus / zoom animation ---- //
+
+    /** Find the feature matching an ISO-3 code. */
+    const featureByIso = useMemo(() => {
+        const map = new Map<string, CountryFeature>();
+        for (const feat of countries) {
+            map.set(getIso(feat), feat);
+        }
+        return map;
+    }, [countries, getIso]);
+
+    /** Animate to the centroid of a feature. */
+    const focusOnFeature = useCallback(
+        (feat: CountryFeature) => {
+            const gl = globeRef.current;
+            if (!gl?.pointOfView) return;
+
+            const [lng, lat] = geoCentroid(feat);
+            gl.pointOfView({ lat, lng, altitude: FOCUS_ALTITUDE }, TRANSITION_MS);
+        },
+        []
+    );
+
+    /** React to external focus requests (e.g. search). */
+    useEffect(() => {
+        if (!focusCountryCode) {
+            // Reset: zoom out
+            setSelectedIso(null);
+            const gl = globeRef.current;
+            if (gl?.pointOfView) {
+                gl.pointOfView({ altitude: DEFAULT_ALTITUDE }, TRANSITION_MS);
+            }
+            return;
+        }
+
+        const feat = featureByIso.get(focusCountryCode);
+        if (feat) {
+            setSelectedIso(focusCountryCode);
+            focusOnFeature(feat);
+        }
+    }, [focusCountryCode, featureByIso, focusOnFeature]);
+
+    // ---- Rendering callbacks ---- //
 
     const capColor = useCallback(
         (feat: object) => {
-            const s = getScore(feat as CountryFeature);
-            if (s < 0) return "rgba(30, 30, 50, 0.6)"; // no data = dark
+            const f = feat as CountryFeature;
+            const iso = getIso(f);
+            const s = getScore(f);
+
+            // Highlight selected country with a bright accent
+            if (iso === selectedIso) {
+                return s >= 0 ? scoreToColor(s) : "rgba(100, 140, 255, 0.8)";
+            }
+
+            if (s < 0) return "rgba(30, 30, 50, 0.6)";
             return scoreToColor(s);
         },
-        [getScore]
+        [getScore, getIso, selectedIso]
     );
 
     const sideColor = useCallback(
         (feat: object) => {
-            const s = getScore(feat as CountryFeature);
+            const f = feat as CountryFeature;
+            const iso = getIso(f);
+            const s = getScore(f);
+
+            if (iso === selectedIso) {
+                return s >= 0 ? scoreToColor(s) : "rgba(100, 140, 255, 0.6)";
+            }
+
             if (s < 0) return "rgba(30, 30, 50, 0.3)";
             return scoreToSideColor(s);
         },
-        [getScore]
+        [getScore, getIso, selectedIso]
+    );
+
+    const strokeColor = useCallback(
+        (feat: object) => {
+            const f = feat as CountryFeature;
+            const iso = getIso(f);
+            return iso === selectedIso
+                ? "rgba(255, 255, 255, 0.8)"
+                : "rgba(255, 255, 255, 0.15)";
+        },
+        [getIso, selectedIso]
+    );
+
+    const altitude = useCallback(
+        (feat: object) => {
+            const f = feat as CountryFeature;
+            const iso = getIso(f);
+            const s = getScore(f);
+
+            // Elevate the selected country so it pops out
+            if (iso === selectedIso) return 0.06;
+
+            return s >= 0 ? 0.01 + s * 0.02 : 0.005;
+        },
+        [getScore, getIso, selectedIso]
     );
 
     const label = useCallback(
@@ -143,7 +236,7 @@ export default function MainGlobe({
 
     return (
         <Globe
-            ref={globeRef as React.Ref<unknown>}
+            ref={globeRef as React.MutableRefObject<undefined>}
             width={dimensions.width}
             height={dimensions.height}
             globeImageUrl="//unpkg.com/three-globe/example/img/earth-dark.jpg"
@@ -151,15 +244,15 @@ export default function MainGlobe({
             polygonsData={countries}
             polygonCapColor={capColor}
             polygonSideColor={sideColor}
-            polygonStrokeColor={() => "rgba(255, 255, 255, 0.15)"}
+            polygonStrokeColor={strokeColor}
             polygonLabel={label}
-            polygonAltitude={(feat: object) => {
-                const s = getScore(feat as CountryFeature);
-                return s >= 0 ? 0.01 + s * 0.02 : 0.005;
-            }}
+            polygonAltitude={altitude}
             onPolygonClick={(feat: object) => {
                 const f = feat as CountryFeature;
                 const s = getScore(f);
+                const iso = getIso(f);
+                setSelectedIso(iso);
+                focusOnFeature(f);
                 onCountryClick?.(f, s);
             }}
             onPolygonHover={(feat: object | null) => {

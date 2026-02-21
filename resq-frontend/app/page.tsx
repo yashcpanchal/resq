@@ -7,6 +7,7 @@ import SidePanel from "@/components/Dashboard/SidePanel";
 import SearchBar from "@/components/Dashboard/SearchBar";
 import { useQuery } from "@tanstack/react-query";
 import { fetchFundingScores } from "@/lib/api";
+import { m49ToIso3 } from "@/lib/countryCodeMap";
 
 // Globe is heavy + needs window — load only on client
 const MainGlobe = dynamic(() => import("@/components/Globe/MainGlobe"), {
@@ -37,14 +38,14 @@ export default function Home() {
 
   const handleCountryClick = useCallback(
     (
-      country: { properties: { name: string; iso_a3?: string; ISO_A3?: string;[key: string]: unknown }; id?: string | number },
+      country: { properties: { name: string;[key: string]: unknown }; id?: string | number },
       score: number
     ) => {
-      const code =
-        country.properties?.iso_a3 ||
-        country.properties?.ISO_A3 ||
-        (country.id as string) ||
-        "???";
+      // Map numeric M49 id → ISO-3 code
+      const numericId = typeof country.id === "number"
+        ? String(country.id).padStart(3, "0")
+        : String(country.id ?? "");
+      const code = m49ToIso3[numericId] ?? numericId;
       setSelected({
         name: country.properties?.name ?? "Unknown",
         code,
@@ -80,6 +81,7 @@ export default function Home() {
       <SearchBar onSelect={handleSearchSelect} />
 
       <MainGlobe
+        focusCountryCode={selected?.code ?? null}
         onCountryClick={handleCountryClick}
       />
 

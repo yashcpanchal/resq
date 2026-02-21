@@ -6,7 +6,7 @@ const STOPS = [0, 0.2, 0.4, 0.6, 0.8, 1.0];
 
 export default function HeatmapLegend() {
     return (
-        <div className="absolute bottom-6 left-6 z-20 flex items-center gap-2 rounded-xl bg-black/60 px-4 py-3 backdrop-blur-md border border-white/10">
+        <div className="absolute bottom-6 left-1/2 -translate-x-1/2 z-20 flex items-center gap-2 rounded-xl bg-black/60 px-4 py-3 backdrop-blur-md border border-white/10">
             <span className="text-xs font-medium text-gray-400 mr-1">
                 Underfunded
             </span>
