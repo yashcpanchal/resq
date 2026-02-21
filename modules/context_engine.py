@@ -56,6 +56,7 @@ _COUNTRY_COORDS: list[tuple[str, float, float, float]] = [
     ("Mozambique", -18.6, 35.5, 7),
     ("Pakistan", 30.3, 69.3, 7),
     ("Bangladesh", 23.6, 90.3, 4),
+    ("Jordan", 31.0, 36.5, 4),
     ("Mali", 17.5, -4.0, 6),
 ]
 
