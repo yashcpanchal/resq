@@ -68,3 +68,28 @@ class MemoRequest(BaseModel):
 class MemoResponse(BaseModel):
     crisis_id: str
     memo: str
+
+
+# ---------- Visionary (Staging Grounds) ---------- #
+
+class StagingRequest(BaseModel):
+    lat: float
+    lng: float
+    radius_m: int = Field(default=2000, ge=100, le=10000)
+
+
+class StagingCandidate(BaseModel):
+    name: str
+    category: str
+    lat: float
+    lng: float
+    osm_id: str
+    viable: bool
+    reason: str
+    confidence: float = Field(..., ge=0.0, le=1.0)
+
+
+class StagingResponse(BaseModel):
+    lat: float
+    lng: float
+    candidates: list[StagingCandidate]
