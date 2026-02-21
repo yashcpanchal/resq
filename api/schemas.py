@@ -68,3 +68,25 @@ class MemoRequest(BaseModel):
 class MemoResponse(BaseModel):
     crisis_id: str
     memo: str
+
+
+# ---------- Context Engine (L3) ---------- #
+
+class IngestRequest(BaseModel):
+    country: str
+
+
+class IngestResponse(BaseModel):
+    country: str
+    chunks_ingested: int
+
+
+class SafetyByCountryRequest(BaseModel):
+    country: str
+
+
+class SafetyByCountryResponse(BaseModel):
+    country: str
+    lat: float | None
+    lng: float | None
+    report: str

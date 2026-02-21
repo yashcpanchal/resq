@@ -18,5 +18,6 @@ async def get_safety_report(lat: float, lng: float) -> str:
     Returns:
         A text summary describing safety conditions.
     """
-    # TODO: Implement Actian VectorAI RAG retrieval
-    return ""
+    from modules.context_engine import get_safety_report as _engine_report
+
+    return await _engine_report(lat, lng)

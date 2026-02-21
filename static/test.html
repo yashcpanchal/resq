@@ -1,0 +1,102 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Layer 3 — Country Test</title>
+  <style>
+    body { font-family: system-ui; max-width: 720px; margin: 2rem auto; padding: 0 1rem; }
+    h1 { color: #333; }
+    label { display: block; margin-top: 1rem; font-weight: 600; }
+    input[type=text] { width: 100%; max-width: 280px; padding: 8px 12px; margin-top: 4px; }
+    button { margin-right: 8px; margin-top: 12px; padding: 10px 18px; cursor: pointer; background: #0066cc; color: #fff; border: none; border-radius: 6px; }
+    button:hover { background: #0052a3; }
+    button:disabled { opacity: 0.6; cursor: not-allowed; }
+    button.secondary { background: #555; }
+    button.secondary:hover { background: #333; }
+    #out { margin-top: 1.5rem; padding: 1rem; min-height: 3rem; background: #f8f9fa; border: 1px solid #dee2e6; border-radius: 8px; white-space: pre-wrap; word-wrap: break-word; font-size: 14px; line-height: 1.5; max-height: 70vh; overflow: auto; }
+    #out.empty { color: #868e96; }
+    .loading { color: #0066cc; }
+    .err { color: #c00; }
+  </style>
+</head>
+<body>
+  <h1>Layer 3 — Country Test</h1>
+  <p>Search by country name. <strong>Ingest</strong> loads GDACS + HDX into the vector DB. <strong>Get report</strong> returns a safety briefing (RAG or live fallback).</p>
+
+  <label for="country">Country</label>
+  <input type="text" id="country" placeholder="e.g. Sudan, Jordan, Ukraine" value="Sudan" />
+
+  <div>
+    <button type="button" id="btnIngest">Ingest</button>
+    <button type="button" id="btnReport" class="secondary">Get safety report</button>
+  </div>
+
+  <div id="out" class="empty">Output will appear here...</div>
+
+  <script>
+    var outEl = document.getElementById('out');
+    var countryEl = document.getElementById('country');
+    var btnIngest = document.getElementById('btnIngest');
+    var btnReport = document.getElementById('btnReport');
+
+    function show(text, isError) {
+      outEl.className = isError ? 'err' : '';
+      outEl.textContent = text;
+    }
+
+    function postJSON(url, body) {
+      return fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body)
+      });
+    }
+
+    btnIngest.addEventListener('click', function() {
+      var c = countryEl.value.trim();
+      if (!c) { show('Please enter a country name.', true); return; }
+
+      btnIngest.disabled = true;
+      outEl.className = 'loading';
+      outEl.textContent = 'Ingesting ' + c + '... This may take 1-2 minutes.';
+
+      postJSON('/api/v1/ingest-reports', { country: c })
+        .then(function(r) { return r.json().then(function(d) { return { ok: r.ok, data: d }; }); })
+        .then(function(result) {
+          if (result.ok) {
+            show('Ingested ' + result.data.chunks_ingested + ' chunks for ' + result.data.country + '.');
+          } else {
+            show('Error: ' + JSON.stringify(result.data.detail || result.data), true);
+          }
+        })
+        .catch(function(err) { show('Request failed: ' + err.message, true); })
+        .finally(function() { btnIngest.disabled = false; });
+    });
+
+    btnReport.addEventListener('click', function() {
+      var c = countryEl.value.trim();
+      if (!c) { show('Please enter a country name.', true); return; }
+
+      btnReport.disabled = true;
+      outEl.className = 'loading';
+      outEl.textContent = 'Loading safety report for ' + c + '...';
+
+      postJSON('/api/v1/safety-report-by-country', { country: c })
+        .then(function(r) { return r.json().then(function(d) { return { ok: r.ok, data: d }; }); })
+        .then(function(result) {
+          if (result.ok) {
+            var text = result.data.report || 'No report returned.';
+            if (result.data.lat != null && result.data.lng != null) {
+              text = 'Coordinates: (' + result.data.lat + ', ' + result.data.lng + ')\n\n' + text;
+            }
+            show(text);
+          } else {
+            show('Error: ' + JSON.stringify(result.data.detail || result.data), true);
+          }
+        })
+        .catch(function(err) { show('Request failed: ' + err.message, true); })
+        .finally(function() { btnReport.disabled = false; });
+    });
+  </script>
+</body>
+</html>
