@@ -1,7 +1,7 @@
 """
 Layer 3 — Context Engine (Safety Intelligence via RAG)
 
-Pipeline: ReliefWeb → chunk → embed (OpenAI) → store (Actian VectorAI) → search.
+Pipeline: GDACS + HDX → chunk → embed (OpenAI) → store (Actian VectorAI) → search.
 Gracefully degrades when Actian or OpenAI credentials are missing.
 """
 
@@ -9,8 +9,10 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import textwrap
 from typing import Any
+from xml.etree import ElementTree as ET
 
 import httpx
 import tiktoken
@@ -21,7 +23,8 @@ logger = logging.getLogger(__name__)
 # Configuration
 # ---------------------------------------------------------------------------
 
-RELIEFWEB_API = "https://api.reliefweb.int/v2/reports"
+GDACS_RSS_URL = "https://www.gdacs.org/xml/rss.xml"
+HDX_CKAN_URL = "https://data.humdata.org/api/3/action/package_search"
 EMBEDDING_MODEL = "text-embedding-3-small"
 EMBEDDING_DIM = 1536
 CHUNK_MAX_TOKENS = 500
@@ -35,7 +38,6 @@ TABLE_NAME = "resq_safety_chunks"
 # ---------------------------------------------------------------------------
 
 _COUNTRY_COORDS: list[tuple[str, float, float, float]] = [
-    # (country, lat_centre, lng_centre, radius_deg)
     ("Sudan", 15.5, 32.5, 8),
     ("Yemen", 15.5, 48.0, 5),
     ("Syria", 35.0, 38.0, 4),
@@ -65,171 +67,151 @@ def _coords_to_country(lat: float, lng: float) -> str:
 
 
 # ---------------------------------------------------------------------------
-# 1.  ReliefWeb Ingest
+# 1a. GDACS RSS Feed — Live Disaster Alerts
 # ---------------------------------------------------------------------------
 
-# Sample data returned when the API is unavailable (demo/hackathon fallback)
-_MOCK_REPORTS: dict[str, list[dict[str, Any]]] = {
-    "Sudan": [
-        {
-            "title": "Sudan: Escalation of armed conflict — Flash Update #42",
-            "body": (
-                "Heavy fighting continues in Khartoum, El-Fasher, and surrounding areas. "
-                "Displacement has surged past 10 million internally displaced persons. "
-                "Access constraints remain severe in Darfur and Kordofan states. "
-                "Humanitarian corridors are intermittently blocked by active combat. "
-                "Road infrastructure is degraded, limiting truck-based aid delivery. "
-                "Security risks include armed checkpoints, carjacking, and unexploded ordnance. "
-                "Health facilities are non-functional in over 60 percent of conflict zones. "
-                "Food insecurity is at crisis levels (IPC Phase 4) across five states. "
-                "Water and sanitation infrastructure is severely damaged in urban centers."
-            ),
-            "source": "OCHA",
-            "date": "2026-02-20T00:00:00+00:00",
-            "country": "Sudan",
-        },
-        {
-            "title": "Sudan: Humanitarian Access Snapshot — February 2026",
-            "body": (
-                "Humanitarian access remains severely constrained across Sudan. "
-                "Armed groups continue to impose movement restrictions. "
-                "Cross-line access from Port Sudan to Darfur is largely suspended. "
-                "Aid warehouses in El Obeid and Nyala have been looted. "
-                "Fuel shortages are impacting logistics operations. "
-                "UN agencies report bureaucratic impediments including visa delays. "
-                "Safe passage agreements are routinely violated. "
-                "Parking and staging areas near El-Fasher airport are contested territory."
-            ),
-            "source": "OCHA",
-            "date": "2026-02-18T00:00:00+00:00",
-            "country": "Sudan",
-        },
-    ],
-    "Yemen": [
-        {
-            "title": "Yemen: Humanitarian Update — Issue 2, February 2026",
-            "body": (
-                "Conflict escalation in Marib and Taiz governorates has displaced "
-                "an additional 35,000 people. Port of Hodeidah operations disrupted "
-                "by renewed airstrikes. Fuel imports down 40 percent month-on-month. "
-                "Cholera cases rising in Aden and Lahj. Road access to northern "
-                "governorates remains largely blocked. Staging areas near Sana'a "
-                "airport are inaccessible due to military activity."
-            ),
-            "source": "OCHA",
-            "date": "2026-02-19T00:00:00+00:00",
-            "country": "Yemen",
-        },
-    ],
+GDACS_NS = {"gdacs": "http://www.gdacs.org"}
+
+_EVENT_TYPE_LABELS = {
+    "EQ": "Earthquake",
+    "TC": "Tropical Cyclone",
+    "FL": "Flood",
+    "VO": "Volcano",
+    "DR": "Drought",
+    "WF": "Wild Fire",
+    "TS": "Tsunami",
 }
 
 
-def _get_mock_reports(country: str) -> list[dict[str, Any]]:
-    """Return mock sample reports when the live API is unavailable."""
-    if country in _MOCK_REPORTS:
-        return _MOCK_REPORTS[country]
-    # Generic fallback
-    return [
-        {
-            "title": f"{country}: Situation Overview (Mock Data)",
-            "body": (
-                f"This is placeholder safety intelligence for {country}. "
-                "The ReliefWeb API requires a pre-approved appname (since Nov 2025). "
-                "Set the RELIEFWEB_APPNAME environment variable with your approved "
-                "appname to fetch live data. Security conditions should be verified "
-                "through official OCHA channels before deploying aid resources."
-            ),
-            "source": "ResQ-Capital (Mock)",
-            "date": "2026-02-21T00:00:00+00:00",
-            "country": country,
-        }
-    ]
+async def fetch_gdacs_alerts(country: str) -> list[dict[str, Any]]:
+    """Fetch current disaster alerts from GDACS RSS filtered by *country*.
 
-
-async def fetch_reliefweb_reports(
-    country: str,
-    limit: int = 10,
-) -> list[dict[str, Any]]:
-    """Fetch the latest situation reports from ReliefWeb for *country*.
-
-    Returns a list of dicts: ``{title, body, source, date}``.
-    Falls back to mock data when the API is unavailable.
+    Returns list of dicts: ``{title, body, source, date, country, alert_level, event_type}``.
     """
-    appname = os.getenv("RELIEFWEB_APPNAME", "resq-capital")
-
-    payload = {
-        "preset": "latest",
-        "limit": limit,
-        "filter": {
-            "field": "country.name",
-            "value": [country],
-        },
-        "fields": {
-            "include": [
-                "title",
-                "body",
-                "source.name",
-                "date.created",
-                "country.name",
-            ],
-        },
-    }
-
-    headers = {
-        "User-Agent": "ResQ-Capital/0.1 (humanitarian-hackathon)",
-        "Accept": "application/json",
-    }
-
     try:
-        async with httpx.AsyncClient(timeout=30) as client:
-            resp = await client.post(
-                RELIEFWEB_API,
-                params={"appname": appname},
-                json=payload,
-                headers=headers,
+        async with httpx.AsyncClient(timeout=20) as client:
+            resp = await client.get(
+                GDACS_RSS_URL,
+                headers={"User-Agent": "ResQ-Capital/0.1"},
             )
             resp.raise_for_status()
-            data = resp.json()
-    except httpx.HTTPStatusError as exc:
-        logger.warning(
-            "ReliefWeb API returned %s — falling back to mock data. "
-            "Set RELIEFWEB_APPNAME env var with a pre-approved appname.",
-            exc.response.status_code,
-        )
-        return _get_mock_reports(country)[:limit]
     except httpx.HTTPError as exc:
-        logger.warning("ReliefWeb API unreachable (%s) — using mock data", exc)
-        return _get_mock_reports(country)[:limit]
+        logger.warning("GDACS RSS unavailable: %s", exc)
+        return []
 
-    reports: list[dict[str, Any]] = []
-    for item in data.get("data", []):
-        fields = item.get("fields", {})
-        body = fields.get("body", "")
-        if not body:
+    try:
+        root = ET.fromstring(resp.text)
+    except ET.ParseError as exc:
+        logger.error("Failed to parse GDACS RSS XML: %s", exc)
+        return []
+
+    country_lower = country.lower()
+    alerts: list[dict[str, Any]] = []
+
+    for item in root.findall(".//item"):
+        gdacs_country = item.findtext("gdacs:country", default="", namespaces=GDACS_NS)
+        if not gdacs_country or country_lower not in gdacs_country.lower():
             continue
-        # Strip HTML tags (lightweight)
-        import re
-        body_clean = re.sub(r"<[^>]+>", " ", body)
-        body_clean = re.sub(r"\s+", " ", body_clean).strip()
 
-        reports.append({
-            "title": fields.get("title", ""),
-            "body": body_clean,
-            "source": (fields.get("source", [{}]) or [{}])[0].get("name", ""),
-            "date": fields.get("date", {}).get("created", ""),
-            "country": (fields.get("country", [{}]) or [{}])[0].get("name", country),
+        title = item.findtext("title", default="")
+        description = item.findtext("description", default="")
+        description_clean = re.sub(r"<[^>]+>", " ", description)
+        description_clean = re.sub(r"\s+", " ", description_clean).strip()
+
+        event_type_code = item.findtext("gdacs:eventtype", default="", namespaces=GDACS_NS)
+        event_type = _EVENT_TYPE_LABELS.get(event_type_code, event_type_code)
+        alert_level = item.findtext("gdacs:alertlevel", default="", namespaces=GDACS_NS)
+        severity = item.findtext("gdacs:severity", default="", namespaces=GDACS_NS)
+        pub_date = item.findtext("pubDate", default="")
+
+        body = (
+            f"GDACS Alert — {event_type} in {gdacs_country}. "
+            f"Alert Level: {alert_level}. Severity: {severity}. "
+            f"{title}. {description_clean}"
+        )
+
+        alerts.append({
+            "title": title,
+            "body": body,
+            "source": "GDACS",
+            "date": pub_date,
+            "country": country,
+            "alert_level": alert_level,
+            "event_type": event_type,
         })
 
-    if not reports:
-        logger.info("No live reports found for %s — using mock data", country)
-        return _get_mock_reports(country)[:limit]
-
-    logger.info("Fetched %d reports for %s from ReliefWeb", len(reports), country)
-    return reports
+    logger.info("GDACS: found %d alerts for %s", len(alerts), country)
+    return alerts
 
 
 # ---------------------------------------------------------------------------
-# 2.  Text Chunking
+# 1b. HDX CKAN API — Humanitarian Reports & Datasets
+# ---------------------------------------------------------------------------
+
+async def fetch_hdx_reports(country: str, limit: int = 5) -> list[dict[str, Any]]:
+    """Search HDX for recent humanitarian reports about *country*.
+
+    Returns list of dicts: ``{title, body, source, date, country}``.
+    """
+    queries = [
+        f"situation report {country}",
+        f"security access {country}",
+        f"humanitarian crisis {country}",
+    ]
+
+    all_reports: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+
+    async with httpx.AsyncClient(timeout=15) as client:
+        for q in queries:
+            try:
+                resp = await client.get(
+                    HDX_CKAN_URL,
+                    params={
+                        "q": q,
+                        "rows": limit,
+                        "sort": "metadata_modified desc",
+                    },
+                    headers={"User-Agent": "ResQ-Capital/0.1"},
+                )
+                resp.raise_for_status()
+                data = resp.json()
+            except httpx.HTTPError as exc:
+                logger.warning("HDX query '%s' failed: %s", q, exc)
+                continue
+
+            for pkg in data.get("result", {}).get("results", []):
+                pkg_id = pkg.get("id", "")
+                if pkg_id in seen_ids:
+                    continue
+                seen_ids.add(pkg_id)
+
+                title = pkg.get("title", "")
+                notes = pkg.get("notes", "")
+                notes_clean = re.sub(r"<[^>]+>", " ", notes)
+                notes_clean = re.sub(r"\s+", " ", notes_clean).strip()
+
+                if not notes_clean:
+                    continue
+
+                org = pkg.get("organization", {})
+                source_name = org.get("title", "HDX") if org else "HDX"
+                modified = pkg.get("metadata_modified", "")
+
+                all_reports.append({
+                    "title": title,
+                    "body": f"HDX Report — {title}. {notes_clean}",
+                    "source": source_name,
+                    "date": modified,
+                    "country": country,
+                })
+
+    logger.info("HDX: found %d reports for %s", len(all_reports), country)
+    return all_reports
+
+
+# ---------------------------------------------------------------------------
+# 2. Text Chunking
 # ---------------------------------------------------------------------------
 
 _enc: tiktoken.Encoding | None = None
@@ -242,7 +224,11 @@ def _get_encoder() -> tiktoken.Encoding:
     return _enc
 
 
-def chunk_text(text: str, max_tokens: int = CHUNK_MAX_TOKENS, overlap: int = CHUNK_OVERLAP_TOKENS) -> list[str]:
+def chunk_text(
+    text: str,
+    max_tokens: int = CHUNK_MAX_TOKENS,
+    overlap: int = CHUNK_OVERLAP_TOKENS,
+) -> list[str]:
     """Split *text* into chunks of roughly *max_tokens* tokens with overlap."""
     enc = _get_encoder()
     tokens = enc.encode(text)
@@ -257,7 +243,7 @@ def chunk_text(text: str, max_tokens: int = CHUNK_MAX_TOKENS, overlap: int = CHU
 
 
 # ---------------------------------------------------------------------------
-# 3.  OpenAI Embeddings
+# 3. OpenAI Embeddings
 # ---------------------------------------------------------------------------
 
 async def embed_text(text: str) -> list[float]:
@@ -289,7 +275,7 @@ async def embed_texts(texts: list[str]) -> list[list[float]]:
 
 
 # ---------------------------------------------------------------------------
-# 4.  Actian VectorAI (pyodbc)
+# 4. Actian VectorAI (pyodbc)
 # ---------------------------------------------------------------------------
 
 def _get_actian_connection():
@@ -303,7 +289,9 @@ def _get_actian_connection():
         import pyodbc
         user = os.getenv("ACTIAN_USER", "")
         password = os.getenv("ACTIAN_PASSWORD", "")
-        conn = pyodbc.connect(f"DSN={dsn};UID={user};PWD={password}", autocommit=True)
+        conn = pyodbc.connect(
+            f"DSN={dsn};UID={user};PWD={password}", autocommit=True,
+        )
         return conn
     except Exception as exc:
         logger.error("Failed to connect to Actian VectorAI: %s", exc)
@@ -314,13 +302,13 @@ def init_table(conn) -> None:
     """Create the vector store table if it does not already exist."""
     ddl = textwrap.dedent(f"""\
         CREATE TABLE IF NOT EXISTS {TABLE_NAME} (
-            id         INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-            country    VARCHAR(120)  NOT NULL,
-            title      VARCHAR(500),
-            chunk_text VARCHAR(8000) NOT NULL,
-            source     VARCHAR(300),
+            id          INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+            country     VARCHAR(120)  NOT NULL,
+            title       VARCHAR(500),
+            chunk_text  VARCHAR(8000) NOT NULL,
+            source      VARCHAR(300),
             report_date VARCHAR(60),
-            embedding  VECTOR({EMBEDDING_DIM}) NOT NULL
+            embedding   VECTOR({EMBEDDING_DIM}) NOT NULL
         )
     """)
     cursor = conn.cursor()
@@ -328,14 +316,8 @@ def init_table(conn) -> None:
     cursor.close()
 
 
-def store_chunks(
-    conn,
-    chunks: list[dict[str, Any]],
-) -> int:
+def store_chunks(conn, chunks: list[dict[str, Any]]) -> int:
     """Insert pre-embedded chunks into Actian VectorAI.
-
-    Each item in *chunks* must have keys:
-        country, title, chunk_text, source, report_date, embedding (list[float])
 
     Returns the number of rows inserted.
     """
@@ -368,13 +350,9 @@ def search_similar(
     country: str | None = None,
     top_k: int = 5,
 ) -> list[dict[str, Any]]:
-    """Find the *top_k* most similar chunks to *query_embedding*.
-
-    Optionally filter by *country*.
-    Returns list of dicts with keys: title, chunk_text, source, report_date, country.
-    """
+    """Find the *top_k* most similar chunks to *query_embedding*."""
     emb_str = ",".join(str(v) for v in query_embedding)
-    where = f"WHERE country = ?" if country else ""
+    where = "WHERE country = ?" if country else ""
     sql = textwrap.dedent(f"""\
         SELECT title, chunk_text, source, report_date, country
         FROM   {TABLE_NAME}
@@ -397,22 +375,31 @@ def search_similar(
 
 
 # ---------------------------------------------------------------------------
-# 5.  High-level Orchestrators
+# 5. High-level Orchestrators
 # ---------------------------------------------------------------------------
 
 async def ingest_country(country: str, limit: int = 10) -> int:
-    """End-to-end: fetch ReliefWeb reports → chunk → embed → store in Actian.
+    """End-to-end: fetch GDACS + HDX → chunk → embed → store in Actian.
 
     Returns the total number of chunks stored.
     """
-    reports = await fetch_reliefweb_reports(country, limit=limit)
-    if not reports:
-        logger.warning("No reports found for %s", country)
+    # Fetch from both sources concurrently
+    gdacs_alerts = await fetch_gdacs_alerts(country)
+    hdx_reports = await fetch_hdx_reports(country, limit=limit)
+
+    combined = gdacs_alerts + hdx_reports
+    if not combined:
+        logger.warning("No data found for %s from GDACS or HDX", country)
         return 0
+
+    logger.info(
+        "Ingesting %d sources for %s (%d GDACS alerts, %d HDX reports)",
+        len(combined), country, len(gdacs_alerts), len(hdx_reports),
+    )
 
     # Chunk all reports
     all_chunks: list[dict[str, Any]] = []
-    for rpt in reports:
+    for rpt in combined:
         text_chunks = chunk_text(rpt["body"])
         for tc in text_chunks:
             all_chunks.append({
@@ -435,7 +422,10 @@ async def ingest_country(country: str, limit: int = 10) -> int:
     # Store in Actian
     conn = _get_actian_connection()
     if conn is None:
-        logger.warning("Actian unavailable — skipping storage for %s (%d chunks)", country, len(all_chunks))
+        logger.warning(
+            "Actian unavailable — skipping storage for %s (%d chunks prepared)",
+            country, len(all_chunks),
+        )
         return 0
 
     try:
@@ -451,42 +441,62 @@ async def get_safety_report(lat: float, lng: float) -> str:
     """Return a safety/security briefing for the location at (*lat*, *lng*).
 
     Performs RAG search against Actian VectorAI. Falls back to a
-    placeholder message when the database is unavailable.
+    live-fetched briefing when the database is unavailable.
     """
     country = _coords_to_country(lat, lng)
 
+    # Try Actian RAG first
     conn = _get_actian_connection()
-    if conn is None:
+    if conn is not None:
+        try:
+            query = f"What are the current security risks and safety conditions in {country}?"
+            query_emb = await embed_text(query)
+            results = search_similar(conn, query_emb, country=country, top_k=5)
+        finally:
+            conn.close()
+
+        if results:
+            sections: list[str] = []
+            for i, r in enumerate(results, 1):
+                sections.append(
+                    f"[{i}] {r['title']} (Source: {r['source']}, "
+                    f"Date: {r['report_date']})\n{r['chunk_text'][:1500]}"
+                )
+            return (
+                f"## Safety & Security Briefing — {country}\n"
+                f"Coordinates: ({lat}, {lng})\n\n"
+                + "\n\n---\n\n".join(sections)
+            )
+
+    # Fallback: fetch live data directly and return as briefing
+    logger.info("Actian unavailable — building live briefing for %s", country)
+    gdacs_alerts = await fetch_gdacs_alerts(country)
+    hdx_reports = await fetch_hdx_reports(country, limit=3)
+
+    parts: list[str] = []
+
+    if gdacs_alerts:
+        parts.append("### Active Disaster Alerts (GDACS)\n")
+        for a in gdacs_alerts[:5]:
+            parts.append(
+                f"- **{a['event_type']}** — Alert: {a['alert_level']} — "
+                f"{a['title']}\n  {a['body'][:300]}\n"
+            )
+
+    if hdx_reports:
+        parts.append("\n### Humanitarian Reports (HDX)\n")
+        for r in hdx_reports[:5]:
+            parts.append(f"- **{r['title']}** ({r['source']})\n  {r['body'][:300]}\n")
+
+    if not parts:
         return (
-            f"[Fallback] Safety intelligence for {country} ({lat}, {lng}) is currently "
-            "unavailable. Actian VectorAI connection not configured. "
-            "Please ingest reports and configure ACTIAN_DSN to enable RAG search."
+            f"No safety intelligence currently available for {country} "
+            f"({lat}, {lng}). Neither GDACS nor HDX returned results."
         )
 
-    try:
-        query = f"What are the current security risks and safety conditions in {country}?"
-        query_emb = await embed_text(query)
-        results = search_similar(conn, query_emb, country=country, top_k=5)
-    finally:
-        conn.close()
-
-    if not results:
-        return (
-            f"No safety intelligence available for {country}. "
-            "Run the /api/v1/ingest-reports endpoint to load ReliefWeb data first."
-        )
-
-    # Assemble briefing from retrieved chunks
-    sections: list[str] = []
-    for i, r in enumerate(results, 1):
-        sections.append(
-            f"[{i}] {r['title']} (Source: {r['source']}, Date: {r['report_date']})\n"
-            f"{r['chunk_text'][:1500]}"
-        )
-
-    briefing = (
+    header = (
         f"## Safety & Security Briefing — {country}\n"
-        f"Coordinates: ({lat}, {lng})\n\n"
-        + "\n\n---\n\n".join(sections)
+        f"Coordinates: ({lat}, {lng})\n"
+        f"*Live data — Actian VectorAI not configured*\n\n"
     )
-    return briefing
+    return header + "\n".join(parts)
