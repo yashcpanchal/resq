@@ -25,9 +25,6 @@ app = FastAPI(
     version="0.1.0",
 )
 
-<<<<<<< HEAD
-app.include_router(router, prefix="")
-=======
 
 @app.get("/")
 def root(request: Request):
@@ -117,4 +114,3 @@ def test_ui():
 
 
 app.include_router(router, prefix="/api/v1")
->>>>>>> 592d5f732bddbd7462b0310394798fcbe260abbf
