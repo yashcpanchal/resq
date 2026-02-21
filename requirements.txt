@@ -5,6 +5,11 @@ python-dotenv==1.2.1
 pydantic==2.12.5
 httpx==0.28.1
 tiktoken==0.12.0
+osmnx
+openai
+requests
+Pillow
+networkx
 
 # Embeddings and synthesis use Gemini REST API via httpx (no SDK).
 # Set GEMINI_API_KEY in .env.
