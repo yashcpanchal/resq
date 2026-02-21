@@ -1,10 +1,10 @@
 # ResQ-Capital API
-fastapi
-uvicorn[standard]
-python-dotenv
-pydantic
-httpx
-tiktoken
+fastapi==0.129.2
+uvicorn[standard]==0.41.0
+python-dotenv==1.2.1
+pydantic==2.12.5
+httpx==0.28.1
+tiktoken==0.12.0
 
 # Embeddings and synthesis use Gemini REST API via httpx (no SDK).
 # Set GEMINI_API_KEY in .env.

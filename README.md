@@ -14,67 +14,85 @@ The backend provides **operational field briefings** for humanitarian workers de
 
 Briefings are synthesized by **OpenRouter LLM** (default: Arcee AI Trinity Large Preview) into: *What Changed This Week* → *Operating Environment* → *Key Risks* → *Local Situation* → *Operational Recommendations*. Aimed at aid workers who are deploying regardless; focus is on how to operate safely, not whether to go.
 
-## Getting Started
+## Prerequisites
 
-### 1. Python environment
+- **Python 3.13+**
+- **Node.js 18+** and **npm**
+- **Docker** (optional, for Actian VectorAI)
+
+## Quickstart
+
+### 1. Clone and set up environment variables
 
 ```bash
-py -3.13 -m venv .venv
-.venv\Scripts\activate   # Windows
-# source .venv/bin/activate  # macOS/Linux
-pip install -r requirements.txt
-pip install actian-beta/actiancortex-0.1.0b1-py3-none-any.whl
+git clone <repo-url> && cd resq
+cp .env.example .env
 ```
 
-### 2. Actian VectorAI (optional but recommended for RAG)
+Edit `.env` and add your [OpenRouter API key](https://openrouter.ai/keys):
 
-For full RAG (ingest + search), run Actian in Docker:
+```
+OPENROUTER_API_KEY=your_key_here
+```
+
+Optional overrides: `OPENROUTER_EMBED_MODEL` (default `openai/text-embedding-3-large`), `OPENROUTER_CHAT_MODEL` (default `arcee-ai/trinity-large-preview:free`), `ACTIAN_SERVER` (default `localhost:50051`).
+
+### 2. Backend (Python / FastAPI)
+
+```bash
+# Create and activate virtual environment
+py -3.13 -m venv .venv
+.venv\Scripts\activate        # Windows
+# source .venv/bin/activate   # macOS/Linux
+
+# Install dependencies
+pip install -r requirements.txt
+
+# (Optional) Install Actian VectorAI for full RAG support
+pip install actian-beta/actiancortex-0.1.0b1-py3-none-any.whl
+
+# Start the API server
+uvicorn app:app --reload
+```
+
+The API runs at **http://localhost:8000**. Without activating the venv you can also run: `.venv\Scripts\python -m uvicorn app:app --reload`.
+
+### 3. Frontend (Next.js)
+
+```bash
+cd resq-frontend
+npm install
+npm run dev
+```
+
+The frontend dev server runs at **http://localhost:3000**.
+
+### 4. Actian VectorAI (optional)
+
+For full RAG (ingest + vector search), run Actian in Docker:
 
 ```bash
 cd actian-beta
 docker compose up -d
 ```
 
-Default: `localhost:50051`. Override with `ACTIAN_SERVER` if needed. If Actian is not running, the API still works using live-fetched data only.
+If Actian is not running, the API still works using live-fetched data only.
 
-### 3. Environment variables
+## API Reference
 
-Create a `.env` file in the project root (or set in the shell):
-
-```
-OPENROUTER_API_KEY=your_openrouter_api_key
-```
-
-Get a key at [OpenRouter Keys](https://openrouter.ai/keys). Used for embeddings and briefing synthesis. Optional overrides: `OPENROUTER_EMBED_MODEL` (default `openai/text-embedding-3-large`), `OPENROUTER_CHAT_MODEL` (default `arcee-ai/trinity-large-preview:free`).
-
-### 4. Start the server
-
-Use the **venv** so Actian (cortex) is available:
-
-```bash
-.venv\Scripts\activate   # Windows
-# source .venv/bin/activate  # macOS/Linux
-uvicorn app:app --reload
-```
-
-Or without activating: `./.venv/Scripts/python -m uvicorn app:app --reload` (Windows). Server runs at **http://localhost:8000** (or the port you specify).
-
-## Test UI and API
-
-- **Test UI (Layer 3):** [http://localhost:8000/test](http://localhost:8000/test) — Enter a country, click **Ingest** to load intelligence into the vector DB, then **Get safety report** for an operational field briefing.
-- **Simple docs:** [http://localhost:8000/docs-simple](http://localhost:8000/docs-simple) — Lightweight API reference (no external CDN).
-- **OpenAPI:** [http://localhost:8000/docs](http://localhost:8000/docs) or [http://localhost:8000/redoc](http://localhost:8000/redoc).
+- **Test UI (Layer 3):** [http://localhost:8000/test](http://localhost:8000/test) — Enter a country, ingest data, get an operational briefing.
+- **OpenAPI docs:** [http://localhost:8000/docs](http://localhost:8000/docs) · [ReDoc](http://localhost:8000/redoc) · [Simple docs](http://localhost:8000/docs-simple)
 
 ### Key endpoints
 
 | Method | Endpoint | Body | Description |
 |--------|----------|------|-------------|
 | `GET` | `/api/v1/health` | — | Health check |
-| `POST` | `/api/v1/ingest-reports` | `{"country": "Sudan"}` | Ingest GDACS, HDX, State Dept, HAPI, news for country into vector DB |
-| `POST` | `/api/v1/ingest-reports-all` | `{}` | Ingest all 202 countries in background |
+| `POST` | `/api/v1/ingest-reports` | `{"country": "Sudan"}` | Ingest GDACS, HDX, State Dept, HAPI, news into vector DB |
+| `POST` | `/api/v1/ingest-reports-all` | `{}` | Ingest all 202 countries (background) |
 | `GET` | `/api/v1/countries` | — | List all supported country names |
-| `POST` | `/api/v1/safety-report-by-country` | `{"country": "Sudan"}` | Operational field briefing by country name |
-| `POST` | `/api/v1/safety-report` | `{"lat": 15.5, "lng": 32.5}` | Location-specific briefing (city + country data) |
+| `POST` | `/api/v1/safety-report-by-country` | `{"country": "Sudan"}` | Operational field briefing by country |
+| `POST` | `/api/v1/safety-report` | `{"lat": 15.5, "lng": 32.5}` | Location-specific briefing (city + country) |
 | `GET` | `/api/v1/neglect-scores` | — | Neglect scores (pipeline) |
 | `POST` | `/api/v1/parking-capacity` | `{"lat": 0, "lng": 0}` | Staging capacity (stub) |
 | `POST` | `/api/v1/generate-memo` | Memo payload | Deployment memo (stub) |
@@ -83,31 +101,47 @@ Or without activating: `./.venv/Scripts/python -m uvicorn app:app --reload` (Win
 
 ```
 resq/
-├── app.py              # FastAPI app, routes /, /test, /docs-simple
+├── app.py                    # FastAPI app entry point
 ├── api/
-│   ├── routes.py       # API route handlers
-│   └── schemas.py      # Pydantic request/response models
+│   ├── routes/
+│   │   ├── __init__.py       # Aggregates all sub-routers
+│   │   ├── context_engine.py # Ingest & safety-report routes
+│   │   ├── pipeline.py       # Neglect-score routes
+│   │   ├── synthesis.py      # Memo generation routes
+│   │   └── vision.py         # Parking capacity routes
+│   └── schemas.py            # Pydantic request/response models
 ├── modules/
-│   ├── context_engine.py  # Layer 3: data fetch, chunk, embed, Actian, OpenRouter synthesis
-│   ├── country_codes.py   # ISO3 / State Dept code maps for all countries
-│   ├── pipeline.py    # Neglect scores (stub)
-│   ├── vision.py      # Parking capacity (stub)
-│   ├── vector.py      # Delegates to context_engine for safety report
-│   └── synthesis.py   # Memo generation (stub)
-├── static/
-│   └── test.html      # Layer 3 test UI (country search, ingest, report)
-├── actian-beta/       # Actian VectorAI Docker setup + cortex wheel
-├── context.txt        # Project spec (architecture, data flow, guardrails)
-├── requirements.txt
-└── README.md
+│   ├── context_engine.py     # Data fetch, chunk, embed, Actian, OpenRouter synthesis
+│   ├── country_codes.py      # ISO3 / State Dept code maps
+│   ├── pipeline.py           # Neglect scores
+│   ├── vision.py             # Parking capacity
+│   ├── vector.py             # Delegates to context_engine for safety report
+│   └── synthesis.py          # Memo generation
+├── resq-frontend/            # Next.js frontend
+│   ├── app/                  # App router pages
+│   ├── components/           # React components
+│   ├── lib/                  # Utilities
+│   └── package.json
+├── static/                   # Backend test UI
+├── actian-beta/              # Actian VectorAI Docker setup + cortex wheel
+├── data/                     # Data files
+├── requirements.txt          # Python dependencies (pinned)
+└── .env.example              # Environment variable template
 ```
 
 ## Dependencies
 
+**Backend** — see `requirements.txt`:
 - **FastAPI / Uvicorn** — API server
 - **httpx** — Async HTTP (GDACS, HDX, State Dept, Google News, OpenRouter)
 - **tiktoken** — Chunking for embeddings
-- **python-dotenv** — Load `.env`
-- **Actian Cortex** — Install from `actian-beta/actiancortex-*.whl` when using the vector DB
+- **python-dotenv** — Environment config
+- **Actian Cortex** *(optional)* — Vector DB, install from `actian-beta/actiancortex-*.whl`
 
-See `requirements.txt`. ReliefWeb is not used (requires pre-approved app name).
+**Frontend** — see `resq-frontend/package.json`:
+- **Next.js / React** — UI framework
+- **Framer Motion** — Animations
+- **React Globe GL** — 3D globe visualization
+- **TanStack React Query** — Data fetching
+- **Radix UI / shadcn** — Component library
+- **Tailwind CSS** — Styling
