@@ -70,6 +70,35 @@ class MemoResponse(BaseModel):
     memo: str
 
 
+# ---------- Visionary (Humanitarian Aid Sites) ---------- #
+
+class AidSiteRequest(BaseModel):
+    lat: float
+    lng: float
+    radius_m: int = Field(default=5000, ge=100, le=20000)
+    max_sites: int = Field(default=10, ge=1, le=50)
+    model: str = Field(default="moondream", description="Ollama vision model name")
+
+
+class AidSiteCandidate(BaseModel):
+    name: str
+    category: str
+    lat: float
+    lng: float
+    osm_id: str
+    analysis: str = ""
+
+
+class AidSiteResponse(BaseModel):
+    lat: float
+    lng: float
+    radius_m: int
+    total_candidates: int
+    analyzed_candidates: int
+    sites: list[AidSiteCandidate]
+
+
+
 # ---------- Context Engine (L3) ---------- #
 
 class IngestRequest(BaseModel):
