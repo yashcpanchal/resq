@@ -1,9 +1,13 @@
+# ResQ-Capital API
 fastapi
 uvicorn[standard]
 python-dotenv
 pydantic
 httpx
-openai
-# actiancortex — install from: actian-beta/actiancortex-0.1.0b1-py3-none-any.whl
 tiktoken
-reverse_geocoder
+
+# Embeddings and synthesis use Gemini REST API via httpx (no SDK).
+# Set GEMINI_API_KEY in .env.
+
+# Actian VectorAI (optional): install from project wheel when using vector DB.
+# pip install actian-beta/actiancortex-0.1.0b1-py3-none-any.whl

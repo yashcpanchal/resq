@@ -79,3 +79,14 @@ class IngestRequest(BaseModel):
 class IngestResponse(BaseModel):
     country: str
     chunks_ingested: int
+
+
+class SafetyByCountryRequest(BaseModel):
+    country: str
+
+
+class SafetyByCountryResponse(BaseModel):
+    country: str
+    lat: float | None
+    lng: float | None
+    report: str

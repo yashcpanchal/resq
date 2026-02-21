@@ -16,6 +16,8 @@ from api.schemas import (
     NeglectScore,
     ParkingRequest,
     ParkingResponse,
+    SafetyByCountryRequest,
+    SafetyByCountryResponse,
     SafetyRequest,
     SafetyResponse,
 )
@@ -23,7 +25,7 @@ from modules.pipeline import get_neglect_scores
 from modules.vision import get_parking_capacity
 from modules.vector import get_safety_report
 from modules.synthesis import generate_memo
-from modules.context_engine import ingest_country
+from modules.context_engine import ingest_country, get_safety_report_by_country
 
 router = APIRouter()
 
@@ -75,6 +77,13 @@ async def memo(req: MemoRequest):
 
 @router.post("/ingest-reports", response_model=IngestResponse)
 async def ingest_reports(req: IngestRequest):
-    """Ingest ReliefWeb situation reports for a country into Actian VectorAI."""
+    """Ingest GDACS, HDX, US State Dept, HAPI and news for a country into Actian VectorAI."""
     count = await ingest_country(req.country)
     return IngestResponse(country=req.country, chunks_ingested=count)
+
+
+@router.post("/safety-report-by-country", response_model=SafetyByCountryResponse)
+async def safety_report_by_country(req: SafetyByCountryRequest):
+    """Get safety report by country name (forward-geocodes to coordinates, then RAG/live)."""
+    report, lat, lng = await get_safety_report_by_country(req.country)
+    return SafetyByCountryResponse(country=req.country, lat=lat, lng=lng, report=report)

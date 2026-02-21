@@ -1,7 +1,7 @@
 """
 Layer 3 — Context Engine (Safety Intelligence via RAG)
 
-Pipeline: GDACS + HDX → chunk → embed (OpenAI) → store (Actian VectorAI) → search.
+Pipeline: GDACS + HDX → chunk → embed (Gemini) → store (Actian VectorAI) → search.
 
 Actian VectorAI DB integration uses the ``cortex`` gRPC Python client
 (not SQL / pyodbc).  Docker: ``docker compose up -d`` in actian-beta/.
@@ -13,13 +13,13 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import base64
 import re
 from typing import Any
 from xml.etree import ElementTree as ET
 
 import httpx
 import tiktoken
-import reverse_geocoder as rg
 
 logger = logging.getLogger(__name__)
 
@@ -29,8 +29,12 @@ logger = logging.getLogger(__name__)
 
 GDACS_RSS_URL = "https://www.gdacs.org/xml/rss.xml"
 HDX_CKAN_URL = "https://data.humdata.org/api/3/action/package_search"
-EMBEDDING_MODEL = "text-embedding-3-small"
-EMBEDDING_DIM = 1536
+HDX_HAPI_URL = "https://hapi.humdata.org/api/v2"
+STATE_DEPT_ADVISORIES_URL = "https://cadataapi.state.gov/api/TravelAdvisories"
+STATE_DEPT_COUNTRY_URL = "https://cadataapi.state.gov/api/CountryTravelInformation"
+GOOGLE_NEWS_RSS_URL = "https://news.google.com/rss/search"
+EMBEDDING_MODEL = "models/gemini-embedding-001"
+EMBEDDING_DIM = 3072
 CHUNK_MAX_TOKENS = 500
 CHUNK_OVERLAP_TOKENS = 50
 
@@ -39,32 +43,52 @@ ACTIAN_SERVER = os.getenv("ACTIAN_SERVER", "localhost:50051")
 COLLECTION_NAME = "safety_intelligence"
 
 # ---------------------------------------------------------------------------
-# Country lookup (Dynamic via reverse_geocoder)
+# Country lookup (async via Nominatim HTTP API — no extra dependency)
 # ---------------------------------------------------------------------------
 
-_CC_TO_NAME = {
-    "AF": "Afghanistan", "BD": "Bangladesh", "CD": "Democratic Republic of the Congo",
-    "ET": "Ethiopia", "HT": "Haiti", "JO": "Jordan", "ML": "Mali", "MZ": "Mozambique",
-    "MM": "Myanmar", "NG": "Nigeria", "PK": "Pakistan", "SO": "Somalia", "SD": "Sudan",
-    "SY": "Syria", "UA": "Ukraine", "YE": "Yemen", "KE": "Kenya", "LB": "Lebanon",
-    "IQ": "Iraq", "SS": "South Sudan", "LY": "Libya", "TD": "Chad", "NE": "Niger",
-    "BF": "Burkina Faso", "CF": "Central African Republic", "VE": "Venezuela",
-    "CO": "Colombia", "EG": "Egypt", "TR": "Turkey", "KZ": "Kazakhstan", "TJ": "Tajikistan",
-    "TM": "Turkmenistan", "CN": "China", "IR": "Iran",
-}
+NOMINATIM_REVERSE = "https://nominatim.openstreetmap.org/reverse"
+NOMINATIM_SEARCH = "https://nominatim.openstreetmap.org/search"
 
 
-def _coords_to_country(lat: float, lng: float) -> str:
-    """Dynamic reverse geocode using reverse_geocoder library."""
+async def _country_to_coords(country: str) -> tuple[float, float] | None:
+    """Forward-geocode country name to (lat, lng) via Nominatim. Returns None if not found."""
     try:
-        results = rg.search((lat, lng))
-        cc = results[0].get("cc", "")
-        best_match = _CC_TO_NAME.get(cc, cc)
-        
-        # Fallback to full country name if CC not in our subset mapping
-        # In a production app, we'd use a full ISO-3166-1 library
-        logger.info("Reverse Geocode: (%s, %s) -> %s (%s)", lat, lng, best_match, cc)
-        return best_match
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get(
+                NOMINATIM_SEARCH,
+                params={"q": country, "format": "json", "limit": 5},
+                headers={"User-Agent": "ResQ-Capital/0.1"},
+            )
+            resp.raise_for_status()
+            results = resp.json()
+            for r in results:
+                if r.get("type") == "country" or "country" in (r.get("type") or ""):
+                    return (float(r["lat"]), float(r["lon"]))
+            if results:
+                return (float(results[0]["lat"]), float(results[0]["lon"]))
+        return None
+    except Exception as exc:
+        logger.error("Forward geocoding failed for %s: %s", country, exc)
+        return None
+
+
+async def _coords_to_country(lat: float, lng: float) -> str:
+    """Reverse-geocode (lat, lng) to a country name via Nominatim HTTP API."""
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get(
+                NOMINATIM_REVERSE,
+                params={"lat": lat, "lon": lng, "format": "jsonv2", "accept-language": "en"},
+                headers={"User-Agent": "ResQ-Capital/0.1"},
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            country = data.get("address", {}).get("country", "")
+            if country:
+                logger.info("Reverse Geocode: (%s, %s) -> %s", lat, lng, country)
+                return country
+        logger.warning("Nominatim returned no country for (%s, %s)", lat, lng)
+        return "Unknown"
     except Exception as exc:
         logger.error("Reverse geocoding failed: %s", exc)
         return "Unknown"
@@ -87,8 +111,14 @@ _EVENT_TYPE_LABELS = {
 }
 
 
-async def fetch_gdacs_alerts(country: str) -> list[dict[str, Any]]:
-    """Fetch current disaster alerts from GDACS RSS filtered by *country*."""
+_ALERT_PRIORITY = {"Red": 3, "Orange": 2, "Green": 1}
+
+
+async def fetch_gdacs_alerts(country: str, min_level: str = "Orange") -> list[dict[str, Any]]:
+    """Fetch disaster alerts from GDACS RSS, filtered by country and severity.
+
+    Only returns alerts at *min_level* or above (Orange/Red by default).
+    """
     try:
         async with httpx.AsyncClient(timeout=20) as client:
             resp = await client.get(
@@ -106,12 +136,17 @@ async def fetch_gdacs_alerts(country: str) -> list[dict[str, Any]]:
         logger.error("Failed to parse GDACS RSS XML: %s", exc)
         return []
 
+    min_pri = _ALERT_PRIORITY.get(min_level, 2)
     country_lower = country.lower()
     alerts: list[dict[str, Any]] = []
 
     for item in root.findall(".//item"):
         gdacs_country = item.findtext("gdacs:country", default="", namespaces=GDACS_NS)
         if not gdacs_country or country_lower not in gdacs_country.lower():
+            continue
+
+        alert_level = item.findtext("gdacs:alertlevel", default="", namespaces=GDACS_NS)
+        if _ALERT_PRIORITY.get(alert_level, 0) < min_pri:
             continue
 
         title = item.findtext("title", default="")
@@ -121,14 +156,12 @@ async def fetch_gdacs_alerts(country: str) -> list[dict[str, Any]]:
 
         event_type_code = item.findtext("gdacs:eventtype", default="", namespaces=GDACS_NS)
         event_type = _EVENT_TYPE_LABELS.get(event_type_code, event_type_code)
-        alert_level = item.findtext("gdacs:alertlevel", default="", namespaces=GDACS_NS)
         severity = item.findtext("gdacs:severity", default="", namespaces=GDACS_NS)
         pub_date = item.findtext("pubDate", default="")
 
         body = (
-            f"GDACS Alert — {event_type} in {gdacs_country}. "
-            f"Alert Level: {alert_level}. Severity: {severity}. "
-            f"{title}. {description_clean}"
+            f"GDACS Disaster Alert [{alert_level.upper()}] — {event_type} in {gdacs_country}. "
+            f"Severity: {severity}. {title}. {description_clean}"
         )
 
         alerts.append({
@@ -141,16 +174,70 @@ async def fetch_gdacs_alerts(country: str) -> list[dict[str, Any]]:
             "event_type": event_type,
         })
 
-    logger.info("GDACS: found %d alerts for %s", len(alerts), country)
+    logger.info("GDACS: found %d alerts (>=%s) for %s", len(alerts), min_level, country)
     return alerts
 
 
-async def fetch_hdx_reports(country: str, limit: int = 5) -> list[dict[str, Any]]:
-    """Search HDX for recent humanitarian reports about *country*."""
+# ---------------------------------------------------------------------------
+# Country-code mappings (ISO3 for HDX, 2-letter for State Dept, ISO3 upper for HAPI)
+# ---------------------------------------------------------------------------
+
+_COUNTRY_TO_ISO3: dict[str, str] = {
+    "afghanistan": "afg", "bangladesh": "bgd", "burkina faso": "bfa",
+    "central african republic": "caf", "chad": "tcd", "colombia": "col",
+    "democratic republic of the congo": "cod", "drc": "cod",
+    "egypt": "egy", "ethiopia": "eth", "haiti": "hti", "india": "ind",
+    "iraq": "irq", "iran": "irn", "jordan": "jor", "kenya": "ken",
+    "lebanon": "lbn", "libya": "lby", "mali": "mli", "mozambique": "moz",
+    "myanmar": "mmr", "niger": "ner", "nigeria": "nga", "pakistan": "pak",
+    "palestine": "pse", "somalia": "som", "south sudan": "ssd",
+    "sudan": "sdn", "syria": "syr", "turkey": "tur", "turkiye": "tur",
+    "ukraine": "ukr", "venezuela": "ven", "yemen": "yem",
+    "china": "chn", "nepal": "npl", "philippines": "phl",
+    "indonesia": "idn", "japan": "jpn", "mexico": "mex", "brazil": "bra",
+}
+
+_COUNTRY_TO_STATE_DEPT: dict[str, str] = {
+    "afghanistan": "AF", "bangladesh": "BG", "burkina faso": "UV",
+    "central african republic": "CT", "chad": "CD", "colombia": "CO",
+    "democratic republic of the congo": "CG", "drc": "CG",
+    "egypt": "EG", "ethiopia": "ET", "haiti": "HA", "india": "IN",
+    "iraq": "IZ", "iran": "IR", "jordan": "JO", "kenya": "KE",
+    "lebanon": "LE", "libya": "LY", "mali": "ML", "mozambique": "MZ",
+    "myanmar": "BM", "niger": "NG", "nigeria": "NI", "pakistan": "PK",
+    "palestine": "GZ", "somalia": "SO", "south sudan": "OD",
+    "sudan": "SU", "syria": "SY", "turkey": "TU", "turkiye": "TU",
+    "ukraine": "UP", "venezuela": "VE", "yemen": "YM",
+    "china": "CH", "nepal": "NP", "philippines": "RP",
+    "indonesia": "ID", "japan": "JA", "mexico": "MX", "brazil": "BR",
+}
+
+_HAPI_APP_ID = base64.b64encode(b"ResQ-Capital:resq@resqcapital.org").decode()
+
+
+def _country_to_iso3(country: str) -> str | None:
+    return _COUNTRY_TO_ISO3.get(country.lower().strip())
+
+
+def _country_to_state_dept_code(country: str) -> str | None:
+    return _COUNTRY_TO_STATE_DEPT.get(country.lower().strip())
+
+
+async def fetch_hdx_reports(country: str, limit: int = 10) -> list[dict[str, Any]]:
+    """Search HDX for humanitarian reports strictly filtered to *country*.
+
+    Uses the HDX CKAN ``fq=groups:{iso3}`` facet to guarantee results
+    are tagged for the correct country, not just keyword matches.
+    """
+    iso3 = _country_to_iso3(country)
+    if not iso3:
+        logger.warning("No ISO3 code for '%s' — HDX results may be inaccurate", country)
+
     queries = [
-        f"situation report {country}",
-        f"security access {country}",
-        f"humanitarian crisis {country}",
+        "conflict security",
+        "humanitarian situation",
+        "displacement protection",
+        "food insecurity",
     ]
 
     all_reports: list[dict[str, Any]] = []
@@ -158,14 +245,17 @@ async def fetch_hdx_reports(country: str, limit: int = 5) -> list[dict[str, Any]
 
     async with httpx.AsyncClient(timeout=15) as client:
         for q in queries:
+            params: dict[str, Any] = {
+                "q": q,
+                "rows": limit,
+                "sort": "metadata_modified desc",
+            }
+            if iso3:
+                params["fq"] = f"groups:{iso3}"
+
             try:
                 resp = await client.get(
-                    HDX_CKAN_URL,
-                    params={
-                        "q": q,
-                        "rows": limit,
-                        "sort": "metadata_modified desc",
-                    },
+                    HDX_CKAN_URL, params=params,
                     headers={"User-Agent": "ResQ-Capital/0.1"},
                 )
                 resp.raise_for_status()
@@ -185,7 +275,7 @@ async def fetch_hdx_reports(country: str, limit: int = 5) -> list[dict[str, Any]
                 notes_clean = re.sub(r"<[^>]+>", " ", notes)
                 notes_clean = re.sub(r"\s+", " ", notes_clean).strip()
 
-                if not notes_clean:
+                if not notes_clean or len(notes_clean) < 50:
                     continue
 
                 org = pkg.get("organization", {})
@@ -194,14 +284,276 @@ async def fetch_hdx_reports(country: str, limit: int = 5) -> list[dict[str, Any]
 
                 all_reports.append({
                     "title": title,
-                    "body": f"HDX Report — {title}. {notes_clean}",
+                    "body": f"[{country}] {title} (Source: {source_name}). {notes_clean}",
                     "source": source_name,
                     "date": modified,
                     "country": country,
                 })
 
-    logger.info("HDX: found %d reports for %s", len(all_reports), country)
+    logger.info("HDX: found %d reports for %s (iso3=%s)", len(all_reports), country, iso3)
     return all_reports
+
+
+# ---------------------------------------------------------------------------
+# 1c. US State Dept Travel Advisories + Country Info
+# ---------------------------------------------------------------------------
+
+async def fetch_travel_advisory(country: str) -> list[dict[str, Any]]:
+    """Fetch US State Department travel advisory and country safety info."""
+    code = _country_to_state_dept_code(country)
+    results: list[dict[str, Any]] = []
+
+    async with httpx.AsyncClient(timeout=15) as client:
+        # Travel advisory (level + summary)
+        try:
+            resp = await client.get(
+                STATE_DEPT_ADVISORIES_URL,
+                headers={"User-Agent": "ResQ-Capital/0.1"},
+            )
+            resp.raise_for_status()
+            for adv in resp.json():
+                cats = adv.get("Category", [])
+                if code and code in cats:
+                    title = adv.get("Title", "")
+                    summary = re.sub(r"<[^>]+>", " ", adv.get("Summary", ""))
+                    summary = re.sub(r"\s+", " ", summary).strip()
+                    body = f"US State Department Travel Advisory: {title}. {summary}"
+                    results.append({
+                        "title": title,
+                        "body": body,
+                        "source": "US State Dept",
+                        "date": adv.get("DatePublished", ""),
+                        "country": country,
+                    })
+                    break
+        except httpx.HTTPError as exc:
+            logger.warning("State Dept advisories failed: %s", exc)
+
+        # Detailed country travel info (safety, health, transportation)
+        if code:
+            try:
+                resp = await client.get(
+                    f"{STATE_DEPT_COUNTRY_URL}/{code}",
+                    headers={"User-Agent": "ResQ-Capital/0.1"},
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                if isinstance(data, list) and data:
+                    data = data[0]
+                if isinstance(data, dict):
+                    for field in [
+                        "safety_and_security", "local_laws_and_special_circumstances",
+                        "health", "travel_and_transportation",
+                    ]:
+                        val = data.get(field, "")
+                        if not val:
+                            continue
+                        clean = re.sub(r"<[^>]+>", " ", str(val))
+                        clean = re.sub(r"\s+", " ", clean).strip()
+                        if len(clean) < 50:
+                            continue
+                        label = field.replace("_", " ").title()
+                        results.append({
+                            "title": f"{country} — {label}",
+                            "body": f"[{country}] US State Dept — {label}: {clean}",
+                            "source": "US State Dept",
+                            "date": "",
+                            "country": country,
+                        })
+            except httpx.HTTPError as exc:
+                logger.warning("State Dept country info for %s failed: %s", code, exc)
+
+    logger.info("State Dept: found %d items for %s (code=%s)", len(results), country, code)
+    return results
+
+
+# ---------------------------------------------------------------------------
+# 1d. HDX HAPI — Structured humanitarian data (conflict events, food security)
+# ---------------------------------------------------------------------------
+
+async def fetch_hapi_data(country: str) -> list[dict[str, Any]]:
+    """Fetch structured conflict events and food security data from HDX HAPI."""
+    iso3 = _country_to_iso3(country)
+    if not iso3:
+        return []
+
+    iso3_upper = iso3.upper()
+    results: list[dict[str, Any]] = []
+
+    async with httpx.AsyncClient(timeout=20) as client:
+        # Conflict events (recent, aggregated by admin1)
+        try:
+            resp = await client.get(
+                f"{HDX_HAPI_URL}/coordination-context/conflict-events",
+                params={
+                    "app_identifier": _HAPI_APP_ID,
+                    "location_code": iso3_upper,
+                    "admin_level": "1",
+                    "limit": "100",
+                },
+                headers={"User-Agent": "ResQ-Capital/0.1"},
+            )
+            resp.raise_for_status()
+            rows = resp.json().get("data", [])
+
+            region_stats: dict[str, dict[str, int]] = {}
+            for r in rows:
+                region = r.get("admin1_name") or "National"
+                etype = r.get("event_type", "unknown")
+                events = r.get("events", 0) or 0
+                fatalities = r.get("fatalities", 0) or 0
+                if events == 0 and fatalities == 0:
+                    continue
+                key = region
+                if key not in region_stats:
+                    region_stats[key] = {"events": 0, "fatalities": 0}
+                region_stats[key]["events"] += events
+                region_stats[key]["fatalities"] += fatalities
+
+            if region_stats:
+                top = sorted(region_stats.items(), key=lambda x: x[1]["fatalities"], reverse=True)[:10]
+                lines = [f"  - {reg}: {s['events']} conflict events, {s['fatalities']} fatalities"
+                         for reg, s in top]
+                body = (
+                    f"[{country}] HDX HAPI Conflict Events Summary (ACLED data).\n"
+                    f"Regions with highest conflict activity:\n" + "\n".join(lines)
+                )
+                results.append({
+                    "title": f"{country} — Conflict Events (ACLED via HAPI)",
+                    "body": body,
+                    "source": "HDX HAPI / ACLED",
+                    "date": "",
+                    "country": country,
+                })
+        except httpx.HTTPError as exc:
+            logger.warning("HAPI conflict-events for %s failed: %s", iso3_upper, exc)
+
+        # Food security (IPC phases)
+        try:
+            resp = await client.get(
+                f"{HDX_HAPI_URL}/food-security-nutrition-poverty/food-security",
+                params={
+                    "app_identifier": _HAPI_APP_ID,
+                    "location_code": iso3_upper,
+                    "admin_level": "1",
+                    "limit": "200",
+                },
+                headers={"User-Agent": "ResQ-Capital/0.1"},
+            )
+            resp.raise_for_status()
+            rows = resp.json().get("data", [])
+
+            crisis_regions: list[str] = []
+            for r in rows:
+                phase_raw = str(r.get("ipc_phase", ""))
+                pop = r.get("population_in_phase", 0) or 0
+                region = r.get("admin1_name") or "National"
+                phase_num = int(re.sub(r"[^0-9]", "", phase_raw) or "0")
+                if phase_num >= 3 and pop > 0:
+                    crisis_regions.append(
+                        f"  - {region}: IPC Phase {phase_raw}, {pop:,} people affected"
+                    )
+
+            if crisis_regions:
+                seen = set()
+                unique = []
+                for line in crisis_regions:
+                    if line not in seen:
+                        seen.add(line)
+                        unique.append(line)
+                body = (
+                    f"[{country}] HDX HAPI Food Security (IPC Classification).\n"
+                    f"Regions at Crisis level or worse (IPC Phase 3+):\n"
+                    + "\n".join(unique[:15])
+                )
+                results.append({
+                    "title": f"{country} — Food Insecurity (IPC via HAPI)",
+                    "body": body,
+                    "source": "HDX HAPI / IPC",
+                    "date": "",
+                    "country": country,
+                })
+        except httpx.HTTPError as exc:
+            logger.warning("HAPI food-security for %s failed: %s", iso3_upper, exc)
+
+    logger.info("HAPI: found %d items for %s", len(results), country)
+    return results
+
+
+# ---------------------------------------------------------------------------
+# 1e. Google News RSS — Breaking news and current events
+# ---------------------------------------------------------------------------
+
+async def fetch_news(country: str, max_articles: int = 10) -> list[dict[str, Any]]:
+    """Fetch recent news headlines relevant to safety/security via Google News RSS.
+
+    Uses multiple targeted queries to get diverse coverage (conflict, disaster,
+    health emergency, political unrest).
+    """
+    queries = [
+        f'"{country}" conflict OR violence OR attack OR security when:7d',
+        f'"{country}" crisis OR emergency OR disaster OR humanitarian when:7d',
+        f'"{country}" protest OR unrest OR coup OR political when:7d',
+    ]
+
+    articles: list[dict[str, Any]] = []
+    seen_titles: set[str] = set()
+
+    async with httpx.AsyncClient(timeout=15) as client:
+        for q in queries:
+            try:
+                resp = await client.get(
+                    GOOGLE_NEWS_RSS_URL,
+                    params={"q": q, "hl": "en-US", "gl": "US", "ceid": "US:en"},
+                    headers={"User-Agent": "ResQ-Capital/0.1"},
+                )
+                resp.raise_for_status()
+
+                root = ET.fromstring(resp.text)
+                for item in root.findall(".//item"):
+                    title = item.findtext("title", "").strip()
+                    if not title or title in seen_titles:
+                        continue
+
+                    country_lower = country.lower()
+                    if country_lower not in title.lower():
+                        desc = item.findtext("description", "").lower()
+                        if country_lower not in desc:
+                            continue
+
+                    seen_titles.add(title)
+                    pub_date = item.findtext("pubDate", "")
+                    source = item.findtext("source", "")
+                    link = item.findtext("link", "")
+                    desc_raw = item.findtext("description", "")
+                    desc_clean = re.sub(r"<[^>]+>", " ", desc_raw)
+                    desc_clean = re.sub(r"\s+", " ", desc_clean).strip()
+
+                    body = (
+                        f"[BREAKING NEWS — {country}] {title} "
+                        f"(Source: {source}, {pub_date}). "
+                        f"{desc_clean}"
+                    )
+
+                    articles.append({
+                        "title": title,
+                        "body": body,
+                        "source": source or "Google News",
+                        "date": pub_date,
+                        "country": country,
+                    })
+
+                    if len(articles) >= max_articles:
+                        break
+            except (httpx.HTTPError, ET.ParseError) as exc:
+                logger.warning("Google News query failed: %s", exc)
+                continue
+
+            if len(articles) >= max_articles:
+                break
+
+    logger.info("Google News: found %d articles for %s", len(articles), country)
+    return articles
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -237,35 +589,56 @@ def chunk_text(
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  SECTION 3 — OPENAI EMBEDDINGS
+#  SECTION 3 — GEMINI EMBEDDINGS (via REST API — no SDK dependency)
 # ═══════════════════════════════════════════════════════════════════════════
 
-async def embed_text(text: str) -> list[float]:
-    """Return the embedding vector for *text* using OpenAI text-embedding-3-small."""
-    from openai import AsyncOpenAI
+GEMINI_EMBED_URL = (
+    "https://generativelanguage.googleapis.com/v1beta/{model}:embedContent"
+)
+GEMINI_BATCH_URL = (
+    "https://generativelanguage.googleapis.com/v1beta/{model}:batchEmbedContents"
+)
 
-    api_key = os.getenv("OPENAI_API_KEY")
+
+def _gemini_api_key() -> str | None:
+    return os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
+
+
+async def embed_text(text: str) -> list[float]:
+    """Return the embedding vector for *text* using Gemini gemini-embedding-001."""
+    api_key = _gemini_api_key()
     if not api_key:
-        logger.warning("OPENAI_API_KEY not set — returning zero vector")
+        logger.warning("GEMINI_API_KEY not set — returning zero vector")
         return [0.0] * EMBEDDING_DIM
 
-    client = AsyncOpenAI(api_key=api_key)
-    resp = await client.embeddings.create(input=[text], model=EMBEDDING_MODEL)
-    return resp.data[0].embedding
+    url = GEMINI_EMBED_URL.format(model=EMBEDDING_MODEL)
+    body = {"model": EMBEDDING_MODEL, "content": {"parts": [{"text": text}]}}
+
+    async with httpx.AsyncClient(timeout=30) as client:
+        resp = await client.post(url, params={"key": api_key}, json=body)
+        resp.raise_for_status()
+        return resp.json()["embedding"]["values"]
 
 
 async def embed_texts(texts: list[str]) -> list[list[float]]:
-    """Batch embed multiple texts using OpenAI text-embedding-3-small."""
-    from openai import AsyncOpenAI
-
-    api_key = os.getenv("OPENAI_API_KEY")
+    """Batch embed multiple texts using Gemini gemini-embedding-001."""
+    api_key = _gemini_api_key()
     if not api_key:
-        logger.warning("OPENAI_API_KEY not set — returning zero vectors")
+        logger.warning("GEMINI_API_KEY not set — returning zero vectors")
         return [[0.0] * EMBEDDING_DIM for _ in texts]
 
-    client = AsyncOpenAI(api_key=api_key)
-    resp = await client.embeddings.create(input=texts, model=EMBEDDING_MODEL)
-    return [d.embedding for d in resp.data]
+    url = GEMINI_BATCH_URL.format(model=EMBEDDING_MODEL)
+    requests = [
+        {"model": EMBEDDING_MODEL, "content": {"parts": [{"text": t}]}}
+        for t in texts
+    ]
+
+    async with httpx.AsyncClient(timeout=60) as client:
+        resp = await client.post(
+            url, params={"key": api_key}, json={"requests": requests},
+        )
+        resp.raise_for_status()
+        return [e["values"] for e in resp.json()["embeddings"]]
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -310,7 +683,7 @@ def init_db(client=None) -> bool:
     """Create the ``safety_intelligence`` collection if it doesn't exist.
 
     Collection schema:
-        - dimension: 1536 (OpenAI text-embedding-3-small)
+        - dimension: 3072 (Gemini gemini-embedding-001)
         - distance_metric: COSINE
         - payload fields: country (str), content (str)
 
@@ -381,7 +754,7 @@ async def ingest_intelligence(
         except Exception:
             _next_id = 0
 
-        # Generate embeddings via OpenAI
+        # Generate embeddings via Gemini
         embeddings = await embed_texts(text_list)
 
         # Prepare batch data
@@ -478,28 +851,172 @@ async def get_safety_brief(
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  SECTION 5 — HIGH-LEVEL ORCHESTRATORS (API Integration)
+#  SECTION 5 — GEMINI GENERATION (synthesize intelligence from chunks)
+# ═══════════════════════════════════════════════════════════════════════════
+
+GEMINI_GENERATE_URL = (
+    "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent"
+)
+
+_BRIEFING_SYSTEM_PROMPT = """\
+You are an operational intelligence analyst writing field briefings for \
+humanitarian workers who are DEPLOYING to this country. They already know \
+it is dangerous — do NOT waste space saying "don't go" or repeating generic \
+warnings. They need to know what has CHANGED, what to WATCH FOR, and how \
+to OPERATE.
+
+AUDIENCE: Aid workers, NGO staff, medical teams entering or already in-country.
+
+STRUCTURE (use these exact headings):
+
+## What Changed This Week
+Summarize ONLY breaking news items (tagged [BREAKING NEWS]). Focus on \
+developments that change the operational picture: new offensives, ceasefires, \
+territorial shifts, attacks on aid workers, infrastructure damage, border \
+closures, disease outbreaks. Include dates and source names.
+
+## Operating Environment
+Synthesize from all sources into a practical picture:
+- **Access & movement**: Which regions are hardest to reach? Known road \
+  blockages, checkpoint patterns, airport/border status if mentioned.
+- **Who controls what**: Faction/group territorial control if data supports it.
+- **Threats to aid operations**: Specific risks to humanitarian staff — \
+  carjacking, diversion, bureaucratic obstruction, targeting patterns.
+- **Health & disease**: Outbreaks, hospital capacity, medical evacuation needs.
+- **Food & displacement**: IPC/food crisis data, IDP movements, camp conditions.
+
+## Key Risks to Be Aware Of
+Bullet-point the TOP 5 concrete, specific risks — not generic "crime exists" \
+but things like "RSF drone strikes on Kordofan aid convoys (20 Feb)" or \
+"Cholera outbreak in Kassala state" or "Checkpoint extortion on Khartoum-Port \
+Sudan highway." Each risk should name a PLACE and a THREAT.
+
+## Operational Recommendations
+Practical, specific advice: communication protocols, supply chain \
+considerations, evacuation routes, coordination contacts, medical prep. \
+NOT generic "stay alert" — things like "Maintain HF radio capability as \
+mobile networks are down in Darfur" or "Coordinate movements through OCHA \
+access working group."
+
+RULES:
+- Discard information about other countries.
+- Be SPECIFIC: name regions, cities, roads, dates, groups.
+- If data is sparse for a section, say so briefly and move on.
+- Cite sources inline (Google News / US State Dept / HDX / GDACS).
+- Keep under 700 words. Use markdown.\
+"""
+
+
+async def _gemini_generate(prompt: str, *, max_tokens: int = 1200) -> str | None:
+    """Call Gemini to generate text with retry on rate-limit (429)."""
+    api_key = _gemini_api_key()
+    if not api_key:
+        return None
+
+    body = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {
+            "temperature": 0.3,
+            "maxOutputTokens": max_tokens,
+        },
+    }
+
+    delays = [5, 15, 30]
+    async with httpx.AsyncClient(timeout=60) as client:
+        for attempt, delay in enumerate(delays):
+            try:
+                resp = await client.post(
+                    GEMINI_GENERATE_URL,
+                    params={"key": api_key},
+                    json=body,
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                return data["candidates"][0]["content"]["parts"][0]["text"]
+            except httpx.HTTPStatusError as exc:
+                if exc.response.status_code == 429 and attempt < len(delays) - 1:
+                    logger.warning("Gemini 429 — retrying in %ds (attempt %d)", delay, attempt + 1)
+                    await asyncio.sleep(delay)
+                    continue
+                logger.error("Gemini generation failed: %s", exc)
+                return None
+            except Exception as exc:
+                logger.error("Gemini generation failed: %s", exc)
+                return None
+    return None
+
+
+async def synthesize_briefing(
+    country: str,
+    chunks: list[str],
+    lat: float | None = None,
+    lng: float | None = None,
+) -> str:
+    """Use Gemini to synthesize retrieved chunks into an actionable briefing.
+
+    Falls back to formatted raw chunks if Gemini is unavailable.
+    """
+    context = "\n\n---\n\n".join(c[:2000] for c in chunks[:10])
+
+    coord_str = f"Coordinates: ({lat}, {lng})\n" if lat is not None else ""
+    prompt = (
+        f"{_BRIEFING_SYSTEM_PROMPT}\n\n"
+        f"TARGET COUNTRY: {country}\n{coord_str}\n"
+        f"RETRIEVED INTELLIGENCE ({len(chunks)} chunks):\n\n{context}\n\n"
+        f"Write the operational field briefing now. Remember: the reader is "
+        f"deploying to {country} regardless — help them operate safely, "
+        f"not decide whether to go."
+    )
+
+    generated = await _gemini_generate(prompt)
+
+    if generated:
+        header = (
+            f"## Operational Field Briefing — {country}\n"
+            f"{coord_str}"
+            f"*Intel from GDACS, HDX, US State Dept, HAPI & live news — synthesized via Gemini*\n\n"
+        )
+        return header + generated
+
+    sections = [f"[{i}] {text[:1500]}" for i, text in enumerate(chunks, 1)]
+    return (
+        f"## Safety & Security Briefing — {country}\n"
+        f"{coord_str}"
+        f"Source: Raw retrieved data (Gemini unavailable)\n\n"
+        + "\n\n---\n\n".join(sections)
+    )
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  SECTION 6 — HIGH-LEVEL ORCHESTRATORS (API Integration)
 # ═══════════════════════════════════════════════════════════════════════════
 
 async def ingest_country(country: str, limit: int = 10) -> int:
-    """End-to-end: fetch GDACS + HDX → chunk → ingest into Actian.
+    """End-to-end: fetch all sources -> chunk -> ingest into Actian.
 
+    Sources: GDACS, HDX CKAN, US State Dept, HDX HAPI, Google News.
     Returns the total number of vectors stored.
     """
-    gdacs_alerts = await fetch_gdacs_alerts(country)
-    hdx_reports = await fetch_hdx_reports(country, limit=limit)
+    results = await asyncio.gather(
+        fetch_gdacs_alerts(country, min_level="Green"),
+        fetch_hdx_reports(country, limit=limit),
+        fetch_travel_advisory(country),
+        fetch_hapi_data(country),
+        fetch_news(country),
+    )
+    gdacs_alerts, hdx_reports, state_reports, hapi_reports, news_articles = results
 
-    combined = gdacs_alerts + hdx_reports
+    combined = gdacs_alerts + hdx_reports + state_reports + hapi_reports + news_articles
     if not combined:
-        logger.warning("No data found for %s from GDACS or HDX", country)
+        logger.warning("No data found for %s from any source", country)
         return 0
 
     logger.info(
-        "Ingesting %d sources for %s (%d GDACS, %d HDX)",
+        "Ingesting %d sources for %s (%d GDACS, %d HDX, %d StateDept, %d HAPI, %d News)",
         len(combined), country, len(gdacs_alerts), len(hdx_reports),
+        len(state_reports), len(hapi_reports), len(news_articles),
     )
 
-    # Chunk all report bodies
     text_list: list[str] = []
     for rpt in combined:
         chunks = chunk_text(rpt["body"])
@@ -513,58 +1030,78 @@ async def ingest_country(country: str, limit: int = 10) -> int:
 
 
 async def get_safety_report(lat: float, lng: float) -> str:
-    """Return a safety/security briefing for the location at (*lat*, *lng*).
+    """Return a safety/security briefing for (*lat*, *lng*).
 
-    Tries Actian RAG first; falls back to live-fetched data.
+    1. Reverse-geocode to country name.
+    2. Fetch breaking news (always live — never stale).
+    3. Try Actian RAG for deeper context -> Gemini synthesis.
+    4. Fallback: live all-source fetch -> Gemini synthesis.
     """
-    country = _coords_to_country(lat, lng)
+    country = await _coords_to_country(lat, lng)
 
-    # Try Actian RAG first
+    news_task = fetch_news(country, max_articles=5)
+
     results, status = await get_safety_brief(
-        country, f"What are the security risks and safety conditions in {country}?"
+        country, f"security risks safety humanitarian situation in {country}",
+        top_k=5,
     )
+
+    news_articles = await news_task
+    news_chunks = [a["body"] for a in news_articles[:5]]
+
     if results:
-        sections = [f"[{i}] {text[:1500]}" for i, text in enumerate(results, 1)]
-        return (
-            f"## Safety & Security Briefing — {country}\n"
-            f"Coordinates: ({lat}, {lng})\n"
-            f"Source: {status}\n\n"
-            + "\n\n---\n\n".join(sections)
-        )
+        combined_chunks = news_chunks + results
+        return await synthesize_briefing(country, combined_chunks, lat, lng)
 
-    # Fallback: fetch live data directly
-    logger.info("RAG fallback (%s) — building live briefing for %s", status, country)
-    gdacs_alerts = await fetch_gdacs_alerts(country)
-    hdx_reports = await fetch_hdx_reports(country, limit=3)
+    logger.info("RAG fallback (%s) — live fetch for %s", status, country)
+    results = await asyncio.gather(
+        fetch_gdacs_alerts(country, min_level="Green"),
+        fetch_hdx_reports(country, limit=5),
+        fetch_travel_advisory(country),
+        fetch_hapi_data(country),
+        fetch_news(country, max_articles=5),
+    )
+    gdacs_alerts, hdx_reports, state_reports, hapi_reports, news_articles = results
 
-    parts: list[str] = []
+    chunks: list[str] = []
+    for item in news_articles[:5]:
+        chunks.append(item["body"])
+    for item in state_reports[:5]:
+        chunks.append(item["body"])
+    for a in gdacs_alerts[:5]:
+        chunks.append(a["body"])
+    for r in hdx_reports[:5]:
+        chunks.append(r["body"])
+    for h in hapi_reports[:3]:
+        chunks.append(h["body"])
 
-    if gdacs_alerts:
-        parts.append("### Active Disaster Alerts (GDACS)\n")
-        for a in gdacs_alerts[:5]:
-            parts.append(
-                f"- **{a['event_type']}** — Alert: {a['alert_level']} — "
-                f"{a['title']}\n  {a['body'][:300]}\n"
-            )
-
-    if hdx_reports:
-        parts.append("\n### Humanitarian Reports (HDX)\n")
-        for r in hdx_reports[:5]:
-            parts.append(f"- **{r['title']}** ({r['source']})\n  {r['body'][:300]}\n")
-
-    if not parts:
+    if not chunks:
         return (
             f"No safety intelligence currently available for {country} "
             f"({lat}, {lng}). {status}. "
-            "Neither GDACS nor HDX returned results."
+            "No sources returned results for this country."
         )
 
-    header = (
-        f"## Safety & Security Briefing — {country}\n"
-        f"Coordinates: ({lat}, {lng})\n"
-        f"*Live data — {status}*\n\n"
-    )
-    return header + "\n".join(parts)
+    return await synthesize_briefing(country, chunks, lat, lng)
+
+
+async def get_safety_report_by_country(country: str) -> tuple[str, float | None, float | None]:
+    """Get safety report for a country by name.
+
+    Forward-geocodes to (lat, lng) then runs the full RAG pipeline.
+    Returns (report_text, lat, lng). lat/lng are None if geocoding failed.
+    """
+    coords = await _country_to_coords(country)
+    if coords is None:
+        return (
+            f"Could not find coordinates for \"{country}\". "
+            "Try a different spelling or use the safety-report endpoint with lat/lng.",
+            None,
+            None,
+        )
+    lat, lng = coords
+    report = await get_safety_report(lat, lng)
+    return report, lat, lng
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -579,50 +1116,35 @@ async def _run_pipeline(country: str) -> None:
     print(f"  Actian Server:  {ACTIAN_SERVER}")
     print(f"{'='*60}\n")
 
-    # ── Step 1: Fetch ──────────────────────────────────────────
     print("[Step 1] Fetching intelligence from GDACS + HDX...")
-    gdacs_alerts = await fetch_gdacs_alerts(country)
+    gdacs_alerts = await fetch_gdacs_alerts(country, min_level="Green")
     hdx_reports = await fetch_hdx_reports(country, limit=5)
     combined = gdacs_alerts + hdx_reports
-    print(f"  → GDACS: {len(gdacs_alerts)} alerts")
-    print(f"  → HDX:   {len(hdx_reports)} reports")
+    print(f"  GDACS: {len(gdacs_alerts)} alerts")
+    print(f"  HDX:   {len(hdx_reports)} reports")
 
     if not combined:
-        print(f"\n  ⚠ No data found for {country}.")
+        print(f"\n  No data found for {country}.")
         return
 
-    # Chunk
     text_list: list[str] = []
     for rpt in combined:
         text_list.extend(chunk_text(rpt["body"]))
-    print(f"  → Chunks: {len(text_list)} text chunks prepared\n")
+    print(f"  Chunks: {len(text_list)} text chunks prepared\n")
 
-    # ── Step 2: Ingest into Actian ─────────────────────────────
     print("[Step 2] Ingesting into Actian VectorAI...")
     stored = await ingest_intelligence(country, text_list)
     if stored > 0:
-        print(f"  → ✅ Stored {stored} vectors in '{COLLECTION_NAME}'")
+        print(f"  Stored {stored} vectors in '{COLLECTION_NAME}'")
     else:
-        print(f"  → ⚠ Actian unavailable — {len(text_list)} chunks ready but not stored")
-        print(f"    Start Docker: cd actian-beta && docker compose up -d")
+        print(f"  Actian unavailable — {len(text_list)} chunks ready but not stored")
+        print(f"  Start Docker: cd actian-beta && docker compose up -d")
 
-    # ── Step 3: Search ─────────────────────────────────────────
-    test_query = "What are the security risks?"
-    print(f"\n[Step 3] Running test search: '{test_query}'")
-    results = await get_safety_brief(country, test_query)
-    if results:
-        print(f"  → ✅ Retrieved {len(results)} relevant chunks:\n")
-        for i, text in enumerate(results, 1):
-            print(f"  --- Result {i} ---")
-            print(f"  {text[:300]}...")
-            print()
-    else:
-        print("  → ⚠ No Actian results — showing raw data preview:\n")
-        for rpt in combined[:3]:
-            print(f"  [{rpt['source']}] {rpt['title']}")
-            print(f"  {rpt['body'][:200]}...\n")
+    print(f"\n[Step 3] Generating safety briefing (Gemini synthesis)...")
+    report = await get_safety_report_by_country(country)
+    print(report[0])
 
-    print(f"{'='*60}")
+    print(f"\n{'='*60}")
     print(f"  Pipeline complete for {country}")
     print(f"{'='*60}\n")
 

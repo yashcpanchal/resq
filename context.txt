@@ -21,8 +21,8 @@
                 Fetch ACAPS Severity and UN OCHA Funding. Perform math to produce the Neglect Index. Output is cached for API consumption.
             </Step>
             
-            <Step order="2" phase="Validation" source="modules/vector.py (Actian)" trigger="On-Demand API Call">
-                When a user selects a crisis in Next.js, FastAPI triggers a vector search in Actian to retrieve unstructured safety reports. Resulting 'Risk Score' is fed to SafetyKit.
+            <Step order="2" phase="Validation" source="modules/context_engine.py + modules/vector.py (Actian)" trigger="On-Demand API Call">
+                When a user selects a crisis or country, FastAPI triggers: (1) live Google News fetch for breaking news; (2) vector search in Actian for stored intel (GDACS, HDX, State Dept, HAPI); (3) Gemini synthesis into an operational field briefing. Resulting briefing and risk context feed SafetyKit and the dashboard.
             </Step>
 
             <Step order="3" phase="Synthesis" source="modules/synthesis.py (Sphinx)" trigger="State Combination">
@@ -47,7 +47,7 @@
 
         <Track sponsor="Actian" challenge="VectorAI">
             <Component>Safety RAG: Contextual Risk Analysis (VectorAI)</Component>
-            <Integration>Processes unstructured PDF/News data to provide 'Safety Context' to the backend</Integration>
+            <Integration>Layer 3 Context Engine: ingests GDACS, HDX, US State Dept, HDX HAPI, and Google News; chunks and embeds via Gemini; stores in Actian; retrieves and synthesizes operational field briefings via Gemini. Briefings target humanitarian workers deploying in-country (what changed this week, operating environment, key risks, operational recommendations).</Integration>
         </Track>
 
         <Track sponsor="Sphinx" challenge="Unique Application">
@@ -59,6 +59,17 @@
             <Component>Safety Layer: Automated Risk Filtering and Guardrails</Component>
             <Integration>Enforces 'No-Deploy' zones in the UI based on Actian security risk scores</Integration>
         </Track>
+
+        <Layer3 name="Context Engine — Operational Intelligence">
+            <DataSources>
+                <Source name="GDACS">Natural disaster alerts (RSS); filtered by country and severity (Orange/Red for display).</Source>
+                <Source name="HDX CKAN">Humanitarian dataset metadata; filtered by ISO3 country group (fq=groups:xxx) for accurate country scope.</Source>
+                <Source name="US State Dept">Travel advisories and CountryTravelInformation (safety, health, transport); no auth.</Source>
+                <Source name="HDX HAPI">Structured data: conflict events (ACLED), food security (IPC); app_identifier required, no API key.</Source>
+                <Source name="Google News RSS">Breaking news (last 7 days); always fetched live at report time; no auth.</Source>
+            </DataSources>
+            <Output>Operational field briefing for humanitarian workers: What Changed This Week, Operating Environment, Key Risks, Operational Recommendations. Synthesized via Gemini from retrieved chunks and live news. ReliefWeb not used (requires pre-approved app name).</Output>
+        </Layer3>
 
         <Track category="Backend Framework">
             <Component>FastAPI (Python 3.13)</Component>
@@ -79,10 +90,14 @@
             <Folder name="modules">
                 <File name="pipeline.py">P1: ACAPS/FTS Data Engineering</File>
                 <File name="vision.py">P2: Satellite CV logic</File>
-                <File name="vector.py">P2: Actian RAG logic</File>
+                <File name="vector.py">P2: Delegates safety report to context_engine</File>
+                <File name="context_engine.py">Layer 3: Data ingest (GDACS, HDX CKAN/HAPI, US State Dept, Google News), chunking, Gemini embeddings, Actian store, RAG + Gemini synthesis for operational briefings</File>
                 <File name="synthesis.py">P3: Sphinx Prompting</File>
             </Folder>
-            <File name="app.py">Main Dashboard (Streamlit)</File>
+            <Folder name="static">
+                <File name="test.html">Layer 3 test UI: country search, ingest, get safety report</File>
+            </Folder>
+            <File name="app.py">FastAPI entry point; serves /, /test, /docs-simple, mounts /api/v1</File>
             <File name=".env">Secrets and API Keys</File>
             <File name="requirements.txt">Shared dependencies</File>
         </Folder>
