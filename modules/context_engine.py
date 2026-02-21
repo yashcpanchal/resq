@@ -835,6 +835,23 @@ def init_db(client=None) -> bool:
 _next_id = 0
 
 
+def _recreate_collection(client) -> None:
+    """Delete and recreate the safety_intelligence collection (recovery from Actian beta corruption)."""
+    from cortex import DistanceMetric
+    try:
+        if client.has_collection(COLLECTION_NAME):
+            client.delete_collection(COLLECTION_NAME)
+        client.create_collection(
+            name=COLLECTION_NAME,
+            dimension=EMBEDDING_DIM,
+            distance_metric=DistanceMetric.COSINE,
+        )
+        logger.info("Recreated collection '%s' after corruption", COLLECTION_NAME)
+    except Exception as exc:
+        logger.error("Failed to recreate collection: %s", exc)
+        raise
+
+
 async def ingest_intelligence(
     country: str,
     text_list: list[str],
@@ -876,13 +893,28 @@ async def ingest_intelligence(
             for text in text_list
         ]
 
-        # Batch upsert into Actian VectorAI
-        client.batch_upsert(
-            COLLECTION_NAME,
-            ids=ids,
-            vectors=vectors,
-            payloads=payloads,
-        )
+        # Batch upsert into Actian VectorAI (with auto-recovery on corruption)
+        try:
+            client.batch_upsert(
+                COLLECTION_NAME,
+                ids=ids,
+                vectors=vectors,
+                payloads=payloads,
+            )
+        except Exception as upsert_exc:
+            logger.warning(
+                "batch_upsert failed (%s) — recreating collection and retrying",
+                upsert_exc,
+            )
+            _recreate_collection(client)
+            _next_id = 0
+            ids = list(range(0, len(text_list)))
+            client.batch_upsert(
+                COLLECTION_NAME,
+                ids=ids,
+                vectors=vectors,
+                payloads=payloads,
+            )
 
         _next_id += len(text_list)
         logger.info(
