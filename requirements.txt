@@ -4,5 +4,5 @@ python-dotenv
 pydantic
 httpx
 openai
-pyodbc
+# actiancortex — install from: actian-beta/actiancortex-0.1.0b1-py3-none-any.whl
 tiktoken

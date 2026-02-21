@@ -2,11 +2,10 @@
 Layer 3 — Context Engine (Safety Intelligence via RAG)
 
 Pipeline: GDACS + HDX → chunk → embed (OpenAI) → store (Actian VectorAI) → search.
-Gracefully degrades when Actian or OpenAI credentials are missing.
 
-CLI usage:
-    python -m modules.context_engine          # full pipeline test
-    python -m modules.context_engine Sudan    # target a specific country
+Actian VectorAI DB integration uses the ``cortex`` gRPC Python client
+(not SQL / pyodbc).  Docker: ``docker compose up -d`` in actian-beta/.
+The DB runs on ``localhost:50051``.
 """
 
 from __future__ import annotations
@@ -15,7 +14,6 @@ import asyncio
 import logging
 import os
 import re
-import textwrap
 from typing import Any
 from xml.etree import ElementTree as ET
 
@@ -35,8 +33,9 @@ EMBEDDING_DIM = 1536
 CHUNK_MAX_TOKENS = 500
 CHUNK_OVERLAP_TOKENS = 50
 
-# Actian VectorAI table — matches the hackathon sponsor requirement
-TABLE_NAME = "safety_intelligence"
+# Actian VectorAI config
+ACTIAN_SERVER = os.getenv("ACTIAN_SERVER", "localhost:50051")
+COLLECTION_NAME = "safety_intelligence"
 
 # ---------------------------------------------------------------------------
 # Country lookup (simple lat/lng → country for the hackathon)
@@ -75,10 +74,6 @@ def _coords_to_country(lat: float, lng: float) -> str:
 #  SECTION 1 — DATA INGESTION (GDACS + HDX)
 # ═══════════════════════════════════════════════════════════════════════════
 
-# ---------------------------------------------------------------------------
-# 1a. GDACS RSS Feed — Live Disaster Alerts
-# ---------------------------------------------------------------------------
-
 GDACS_NS = {"gdacs": "http://www.gdacs.org"}
 
 _EVENT_TYPE_LABELS = {
@@ -93,11 +88,7 @@ _EVENT_TYPE_LABELS = {
 
 
 async def fetch_gdacs_alerts(country: str) -> list[dict[str, Any]]:
-    """Fetch current disaster alerts from GDACS RSS filtered by *country*.
-
-    Returns list of dicts with keys: title, body, source, date, country,
-    alert_level, event_type.
-    """
+    """Fetch current disaster alerts from GDACS RSS filtered by *country*."""
     try:
         async with httpx.AsyncClient(timeout=20) as client:
             resp = await client.get(
@@ -154,15 +145,8 @@ async def fetch_gdacs_alerts(country: str) -> list[dict[str, Any]]:
     return alerts
 
 
-# ---------------------------------------------------------------------------
-# 1b. HDX CKAN API — Humanitarian Reports & Datasets
-# ---------------------------------------------------------------------------
-
 async def fetch_hdx_reports(country: str, limit: int = 5) -> list[dict[str, Any]]:
-    """Search HDX for recent humanitarian reports about *country*.
-
-    Returns list of dicts with keys: title, body, source, date, country.
-    """
+    """Search HDX for recent humanitarian reports about *country*."""
     queries = [
         f"situation report {country}",
         f"security access {country}",
@@ -285,157 +269,149 @@ async def embed_texts(texts: list[str]) -> list[list[float]]:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  SECTION 4 — ACTIAN VectorAI (pyodbc)
+#  SECTION 4 — ACTIAN VectorAI DB (gRPC via cortex client)
 # ═══════════════════════════════════════════════════════════════════════════
 
-def _get_actian_connection():
-    """Return a pyodbc connection to Actian VectorAI, or None.
+def _get_cortex_client():
+    """Return a sync CortexClient connected to Actian VectorAI, or None.
 
-    Supports two connection modes:
-      - DSN-based:    set ACTIAN_DSN
-      - Direct:       set ACTIAN_HOST (defaults to localhost)
-
-    Docker: docker pull williamimoh/actian-vectorai-db:1.0b
+    IMPORTANT: The caller must close via ``client.__exit__(None, None, None)``
+    or use it as a context manager.
     """
     try:
-        import pyodbc
-    except ImportError:
-        logger.warning("pyodbc not installed — Actian VectorAI unavailable")
-        return None
-
-    dsn = os.getenv("ACTIAN_DSN")
-    host = os.getenv("ACTIAN_HOST", "")
-    user = os.getenv("ACTIAN_USER", "")
-    password = os.getenv("ACTIAN_PASSWORD", "")
-    database = os.getenv("ACTIAN_DATABASE", "iidbdb")
-    port = os.getenv("ACTIAN_PORT", "VW")
-
-    if not dsn and not host:
-        logger.warning(
-            "Neither ACTIAN_DSN nor ACTIAN_HOST is set — "
-            "Actian VectorAI unavailable"
-        )
-        return None
-
-    try:
-        if dsn:
-            conn_str = f"DSN={dsn};UID={user};PWD={password}"
-        else:
-            conn_str = (
-                f"driver=Ingres;servertype=ingres;"
-                f"server=@{host},tcp_ip,{port};"
-                f"uid={user};pwd={password};database={database}"
-            )
-        conn = pyodbc.connect(conn_str, autocommit=True)
-        logger.info("Connected to Actian VectorAI")
-        return conn
+        from cortex import CortexClient
+        client = CortexClient(ACTIAN_SERVER)
+        client.__enter__()  # required to initialize the gRPC channel
+        client.health_check()
+        return client
     except Exception as exc:
-        logger.error("Failed to connect to Actian VectorAI: %s", exc)
+        logger.warning("Actian VectorAI unavailable at %s: %s", ACTIAN_SERVER, exc)
+        return None
+
+
+async def _get_async_cortex_client():
+    """Return an AsyncCortexClient connected to Actian VectorAI, or None."""
+    try:
+        from cortex import AsyncCortexClient
+        client = AsyncCortexClient(ACTIAN_SERVER)
+        await client.__aenter__()
+        await client.health_check()
+        return client
+    except Exception as exc:
+        logger.warning("Actian VectorAI unavailable at %s: %s", ACTIAN_SERVER, exc)
         return None
 
 
 # ---------------------------------------------------------------------------
-# 4a. init_db() — Create the safety_intelligence table
+# 4a. init_db() — Create the safety_intelligence collection
 # ---------------------------------------------------------------------------
 
-def init_db(conn=None) -> bool:
-    """Create the ``safety_intelligence`` table if it doesn't exist.
+def init_db(client=None) -> bool:
+    """Create the ``safety_intelligence`` collection if it doesn't exist.
 
-    Schema:
-        id        INT  (auto-increment)
-        country   VARCHAR(200)
-        content   VARCHAR(8000)
-        embedding VECTOR(1536)
+    Collection schema:
+        - dimension: 1536 (OpenAI text-embedding-3-small)
+        - distance_metric: COSINE
+        - payload fields: country (str), content (str)
 
-    Returns True on success, False if the connection is unavailable.
+    Returns True on success, False if unavailable.
     """
     close_after = False
-    if conn is None:
-        conn = _get_actian_connection()
+    if client is None:
+        client = _get_cortex_client()
         close_after = True
-    if conn is None:
+    if client is None:
         return False
 
-    ddl = textwrap.dedent(f"""\
-        CREATE TABLE IF NOT EXISTS {TABLE_NAME} (
-            id        INT          NOT NULL GENERATED ALWAYS AS IDENTITY,
-            country   VARCHAR(200) NOT NULL,
-            content   VARCHAR(8000) NOT NULL,
-            embedding VECTOR({EMBEDDING_DIM}) NOT NULL
-        )
-    """)
     try:
-        cursor = conn.cursor()
-        cursor.execute(ddl)
-        cursor.close()
-        logger.info("Table '%s' is ready", TABLE_NAME)
+        from cortex import DistanceMetric
+
+        if not client.has_collection(COLLECTION_NAME):
+            client.create_collection(
+                name=COLLECTION_NAME,
+                dimension=EMBEDDING_DIM,
+                distance_metric=DistanceMetric.COSINE,
+            )
+            logger.info("Created collection '%s' (dim=%d, COSINE)", COLLECTION_NAME, EMBEDDING_DIM)
+        else:
+            logger.info("Collection '%s' already exists", COLLECTION_NAME)
         return True
     except Exception as exc:
         logger.error("init_db failed: %s", exc)
         return False
     finally:
         if close_after:
-            conn.close()
+            client.__exit__(None, None, None)
 
 
 # ---------------------------------------------------------------------------
-# 4b. ingest_intelligence() — Embed + Store
+# 4b. ingest_intelligence() — Embed + Store in Actian VectorAI
 # ---------------------------------------------------------------------------
+
+_next_id = 0
+
 
 async def ingest_intelligence(
     country: str,
     text_list: list[str],
-    conn=None,
 ) -> int:
-    """Generate embeddings for each text and insert into Actian VectorAI.
+    """Generate embeddings and insert into Actian VectorAI.
 
-    Args:
-        country:   Country name (e.g. "Sudan").
-        text_list: List of text strings to embed and store.
-        conn:      Optional existing pyodbc connection.
+    Uses ``batch_upsert`` with payloads storing country + content.
 
-    Returns the number of rows inserted, or 0 if the DB is unavailable.
+    Returns the number of vectors inserted, or 0 if the DB is unavailable.
     """
+    global _next_id
+
     if not text_list:
         return 0
 
-    close_after = False
-    if conn is None:
-        conn = _get_actian_connection()
-        close_after = True
-    if conn is None:
+    client = _get_cortex_client()
+    if client is None:
         logger.warning("Actian unavailable — cannot ingest %d texts", len(text_list))
         return 0
 
     try:
-        init_db(conn)
+        # Ensure collection exists
+        init_db(client)
 
-        # Generate embeddings
+        # Get current count to generate unique IDs
+        try:
+            _next_id = client.count(COLLECTION_NAME)
+        except Exception:
+            _next_id = 0
+
+        # Generate embeddings via OpenAI
         embeddings = await embed_texts(text_list)
 
-        # Critical Actian SQL syntax — TO_VECTOR(?)
-        sql = (
-            f"INSERT INTO {TABLE_NAME} (country, content, embedding) "
-            f"VALUES (?, ?, TO_VECTOR(?))"
+        # Prepare batch data
+        ids = list(range(_next_id, _next_id + len(text_list)))
+        vectors = [emb for emb in embeddings]
+        payloads = [
+            {"country": country, "content": text}
+            for text in text_list
+        ]
+
+        # Batch upsert into Actian VectorAI
+        client.batch_upsert(
+            COLLECTION_NAME,
+            ids=ids,
+            vectors=vectors,
+            payloads=payloads,
         )
 
-        cursor = conn.cursor()
-        count = 0
-        for text, emb in zip(text_list, embeddings):
-            emb_str = ",".join(str(v) for v in emb)
-            cursor.execute(sql, (country, text[:8000], emb_str))
-            count += 1
-        cursor.close()
-
-        logger.info("Ingested %d rows for %s into '%s'", count, country, TABLE_NAME)
-        return count
+        _next_id += len(text_list)
+        logger.info(
+            "Ingested %d vectors for %s into '%s'",
+            len(text_list), country, COLLECTION_NAME,
+        )
+        return len(text_list)
 
     except Exception as exc:
         logger.error("ingest_intelligence failed: %s", exc)
         return 0
     finally:
-        if close_after:
-            conn.close()
+        client.__exit__(None, None, None)
 
 
 # ---------------------------------------------------------------------------
@@ -446,48 +422,55 @@ async def get_safety_brief(
     country: str,
     query: str,
     top_k: int = 3,
-    conn=None,
 ) -> list[str]:
     """Embed the *query* and retrieve the top-k most relevant chunks.
 
-    Uses Actian's hybrid search: filter by country, sort by VECTOR_DISTANCE.
+    Uses Actian's filtered search: filter by country, sort by vector similarity.
 
-    Returns a list of content strings, or an empty list if unavailable.
+    Returns a list of content strings, or empty list if unavailable.
     """
-    close_after = False
-    if conn is None:
-        conn = _get_actian_connection()
-        close_after = True
-    if conn is None:
+    client = _get_cortex_client()
+    if client is None:
         return []
 
     try:
-        query_emb = await embed_text(query)
-        emb_str = ",".join(str(v) for v in query_emb)
+        from cortex.filters import Filter, Field
 
-        # Critical Actian SQL syntax — VECTOR_DISTANCE + TO_VECTOR
-        sql = (
-            f"SELECT content FROM {TABLE_NAME} "
-            f"WHERE country = ? "
-            f"ORDER BY VECTOR_DISTANCE(embedding, TO_VECTOR(?)) ASC "
-            f"LIMIT 3"
+        # Embed the query
+        query_emb = await embed_text(query)
+
+        # Build country filter
+        country_filter = Filter().must(Field("country").eq(country))
+
+        # Filtered search — returns results sorted by similarity
+        results = client.search_filtered(
+            COLLECTION_NAME,
+            query=query_emb,
+            search_filter=country_filter,
+            top_k=top_k,
         )
 
-        cursor = conn.cursor()
-        cursor.execute(sql, (country, emb_str))
-        rows = cursor.fetchall()
-        cursor.close()
+        # Retrieve payloads for each result
+        contents: list[str] = []
+        for r in results:
+            try:
+                _, payload = client.get(COLLECTION_NAME, r.id)
+                if payload and "content" in payload:
+                    contents.append(payload["content"])
+            except Exception:
+                pass
 
-        results = [row[0] for row in rows]
-        logger.info("get_safety_brief: %d results for '%s' in %s", len(results), query[:50], country)
-        return results
+        logger.info(
+            "get_safety_brief: %d results for '%s' in %s",
+            len(contents), query[:50], country,
+        )
+        return contents
 
     except Exception as exc:
         logger.error("get_safety_brief failed: %s", exc)
         return []
     finally:
-        if close_after:
-            conn.close()
+        client.close()
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -497,7 +480,7 @@ async def get_safety_brief(
 async def ingest_country(country: str, limit: int = 10) -> int:
     """End-to-end: fetch GDACS + HDX → chunk → ingest into Actian.
 
-    Returns the total number of rows stored.
+    Returns the total number of vectors stored.
     """
     gdacs_alerts = await fetch_gdacs_alerts(country)
     hdx_reports = await fetch_hdx_reports(country, limit=limit)
@@ -512,7 +495,7 @@ async def ingest_country(country: str, limit: int = 10) -> int:
         len(combined), country, len(gdacs_alerts), len(hdx_reports),
     )
 
-    # Chunk all report bodies into smaller pieces
+    # Chunk all report bodies
     text_list: list[str] = []
     for rpt in combined:
         chunks = chunk_text(rpt["body"])
@@ -521,7 +504,6 @@ async def ingest_country(country: str, limit: int = 10) -> int:
     if not text_list:
         return 0
 
-    # Ingest into Actian VectorAI
     stored = await ingest_intelligence(country, text_list)
     return stored
 
@@ -533,7 +515,7 @@ async def get_safety_report(lat: float, lng: float) -> str:
     """
     country = _coords_to_country(lat, lng)
 
-    # Try Actian RAG search first
+    # Try Actian RAG first
     results = await get_safety_brief(
         country, f"What are the security risks and safety conditions in {country}?"
     )
@@ -546,7 +528,7 @@ async def get_safety_report(lat: float, lng: float) -> str:
             + "\n\n---\n\n".join(sections)
         )
 
-    # Fallback: fetch live data directly and return as briefing
+    # Fallback: fetch live data directly
     logger.info("Actian unavailable — building live briefing for %s", country)
     gdacs_alerts = await fetch_gdacs_alerts(country)
     hdx_reports = await fetch_hdx_reports(country, limit=3)
@@ -589,39 +571,40 @@ async def _run_pipeline(country: str) -> None:
     print(f"\n{'='*60}")
     print(f"  ResQ-Capital — Layer 3 Context Engine")
     print(f"  Target Country: {country}")
+    print(f"  Actian Server:  {ACTIAN_SERVER}")
     print(f"{'='*60}\n")
 
-    # Step 1: Fetch data from GDACS + HDX
+    # ── Step 1: Fetch ──────────────────────────────────────────
     print("[Step 1] Fetching intelligence from GDACS + HDX...")
     gdacs_alerts = await fetch_gdacs_alerts(country)
     hdx_reports = await fetch_hdx_reports(country, limit=5)
+    combined = gdacs_alerts + hdx_reports
     print(f"  → GDACS: {len(gdacs_alerts)} alerts")
     print(f"  → HDX:   {len(hdx_reports)} reports")
 
-    combined = gdacs_alerts + hdx_reports
     if not combined:
-        print(f"\n  ⚠ No data found for {country}. Try a different country.")
+        print(f"\n  ⚠ No data found for {country}.")
         return
 
-    # Chunk the text
+    # Chunk
     text_list: list[str] = []
     for rpt in combined:
-        chunks = chunk_text(rpt["body"])
-        text_list.extend(chunks)
-    print(f"  → Chunks: {len(text_list)} text chunks prepared")
+        text_list.extend(chunk_text(rpt["body"]))
+    print(f"  → Chunks: {len(text_list)} text chunks prepared\n")
 
-    # Step 2: Ingest into Actian VectorAI
-    print("\n[Step 2] Ingesting into Actian VectorAI...")
+    # ── Step 2: Ingest into Actian ─────────────────────────────
+    print("[Step 2] Ingesting into Actian VectorAI...")
     stored = await ingest_intelligence(country, text_list)
     if stored > 0:
-        print(f"  → ✅ Stored {stored} rows in '{TABLE_NAME}'")
+        print(f"  → ✅ Stored {stored} vectors in '{COLLECTION_NAME}'")
     else:
         print(f"  → ⚠ Actian unavailable — {len(text_list)} chunks ready but not stored")
-        print("    Set ACTIAN_DSN or ACTIAN_HOST env vars to enable storage")
+        print(f"    Start Docker: cd actian-beta && docker compose up -d")
 
-    # Step 3: Search
-    print(f"\n[Step 3] Running test search: 'What are the security risks?'")
-    results = await get_safety_brief(country, "What are the security risks?")
+    # ── Step 3: Search ─────────────────────────────────────────
+    test_query = "What are the security risks?"
+    print(f"\n[Step 3] Running test search: '{test_query}'")
+    results = await get_safety_brief(country, test_query)
     if results:
         print(f"  → ✅ Retrieved {len(results)} relevant chunks:\n")
         for i, text in enumerate(results, 1):
@@ -629,13 +612,12 @@ async def _run_pipeline(country: str) -> None:
             print(f"  {text[:300]}...")
             print()
     else:
-        print("  → ⚠ No Actian results (DB not connected)")
-        print("    Falling back to live data preview:\n")
+        print("  → ⚠ No Actian results — showing raw data preview:\n")
         for rpt in combined[:3]:
             print(f"  [{rpt['source']}] {rpt['title']}")
             print(f"  {rpt['body'][:200]}...\n")
 
-    print(f"\n{'='*60}")
+    print(f"{'='*60}")
     print(f"  Pipeline complete for {country}")
     print(f"{'='*60}\n")
 
