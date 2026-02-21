@@ -17,7 +17,7 @@ from api.schemas import (
     SafetyRequest,
     SafetyResponse,
 )
-from modules.pipeline import get_neglect_scores
+from modules.pipeline import calculate_funding_scores, get_neglect_scores
 from modules.vision import get_parking_capacity
 from modules.vector import get_safety_report
 from modules.synthesis import generate_memo
@@ -39,6 +39,12 @@ async def neglect_scores():
     """Return computed neglect scores for all tracked crises."""
     data = await get_neglect_scores()
     return data
+
+
+@router.get("/funding-scores")
+async def funding_scores():
+    """Return funding score (received / required) per country."""
+    return calculate_funding_scores()
 
 
 # ---- Vision ---- #
