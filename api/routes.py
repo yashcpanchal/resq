@@ -9,6 +9,8 @@ from __future__ import annotations
 from fastapi import APIRouter
 
 from api.schemas import (
+    IngestRequest,
+    IngestResponse,
     MemoRequest,
     MemoResponse,
     NeglectScore,
@@ -21,6 +23,7 @@ from modules.pipeline import get_neglect_scores
 from modules.vision import get_parking_capacity
 from modules.vector import get_safety_report
 from modules.synthesis import generate_memo
+from modules.context_engine import ingest_country
 
 router = APIRouter()
 
@@ -66,3 +69,12 @@ async def memo(req: MemoRequest):
     """Generate a deployment plan memo from aggregated data."""
     text = await generate_memo(req.model_dump())
     return MemoResponse(crisis_id=req.crisis_id, memo=text)
+
+
+# ---- Context Engine (L3) ---- #
+
+@router.post("/ingest-reports", response_model=IngestResponse)
+async def ingest_reports(req: IngestRequest):
+    """Ingest ReliefWeb situation reports for a country into Actian VectorAI."""
+    count = await ingest_country(req.country)
+    return IngestResponse(country=req.country, chunks_ingested=count)
