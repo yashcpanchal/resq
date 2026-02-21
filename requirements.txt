@@ -6,3 +6,4 @@ httpx
 openai
 # actiancortex — install from: actian-beta/actiancortex-0.1.0b1-py3-none-any.whl
 tiktoken
+reverse_geocoder

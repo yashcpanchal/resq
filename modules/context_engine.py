@@ -19,6 +19,7 @@ from xml.etree import ElementTree as ET
 
 import httpx
 import tiktoken
+import reverse_geocoder as rg
 
 logger = logging.getLogger(__name__)
 
@@ -38,37 +39,35 @@ ACTIAN_SERVER = os.getenv("ACTIAN_SERVER", "localhost:50051")
 COLLECTION_NAME = "safety_intelligence"
 
 # ---------------------------------------------------------------------------
-# Country lookup (simple lat/lng → country for the hackathon)
+# Country lookup (Dynamic via reverse_geocoder)
 # ---------------------------------------------------------------------------
 
-_COUNTRY_COORDS: list[tuple[str, float, float, float]] = [
-    ("Sudan", 15.5, 32.5, 8),
-    ("Yemen", 15.5, 48.0, 5),
-    ("Syria", 35.0, 38.0, 4),
-    ("Somalia", 5.0, 46.0, 6),
-    ("Afghanistan", 33.9, 67.7, 6),
-    ("Ethiopia", 9.0, 38.7, 6),
-    ("Democratic Republic of the Congo", -4.0, 21.7, 8),
-    ("Myanmar", 19.7, 96.2, 6),
-    ("Nigeria", 9.0, 8.0, 5),
-    ("Ukraine", 48.3, 31.1, 7),
-    ("Haiti", 19.0, -72.0, 3),
-    ("Mozambique", -18.6, 35.5, 7),
-    ("Pakistan", 30.3, 69.3, 7),
-    ("Bangladesh", 23.6, 90.3, 4),
-    ("Jordan", 31.0, 36.5, 4),
-    ("Mali", 17.5, -4.0, 6),
-]
+_CC_TO_NAME = {
+    "AF": "Afghanistan", "BD": "Bangladesh", "CD": "Democratic Republic of the Congo",
+    "ET": "Ethiopia", "HT": "Haiti", "JO": "Jordan", "ML": "Mali", "MZ": "Mozambique",
+    "MM": "Myanmar", "NG": "Nigeria", "PK": "Pakistan", "SO": "Somalia", "SD": "Sudan",
+    "SY": "Syria", "UA": "Ukraine", "YE": "Yemen", "KE": "Kenya", "LB": "Lebanon",
+    "IQ": "Iraq", "SS": "South Sudan", "LY": "Libya", "TD": "Chad", "NE": "Niger",
+    "BF": "Burkina Faso", "CF": "Central African Republic", "VE": "Venezuela",
+    "CO": "Colombia", "EG": "Egypt", "TR": "Turkey", "KZ": "Kazakhstan", "TJ": "Tajikistan",
+    "TM": "Turkmenistan", "CN": "China", "IR": "Iran",
+}
 
 
 def _coords_to_country(lat: float, lng: float) -> str:
-    """Best-effort reverse geocode using a simple distance heuristic."""
-    best, best_dist = "Unknown", float("inf")
-    for name, clat, clng, radius in _COUNTRY_COORDS:
-        dist = ((lat - clat) ** 2 + (lng - clng) ** 2) ** 0.5
-        if dist < radius and dist < best_dist:
-            best, best_dist = name, dist
-    return best
+    """Dynamic reverse geocode using reverse_geocoder library."""
+    try:
+        results = rg.search((lat, lng))
+        cc = results[0].get("cc", "")
+        best_match = _CC_TO_NAME.get(cc, cc)
+        
+        # Fallback to full country name if CC not in our subset mapping
+        # In a production app, we'd use a full ISO-3166-1 library
+        logger.info("Reverse Geocode: (%s, %s) -> %s (%s)", lat, lng, best_match, cc)
+        return best_match
+    except Exception as exc:
+        logger.error("Reverse geocoding failed: %s", exc)
+        return "Unknown"
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -416,62 +415,66 @@ async def ingest_intelligence(
 
 
 # ---------------------------------------------------------------------------
-# 4c. get_safety_brief() — Hybrid Search (filter + vector distance)
+# 4c. get_safety_brief() — Vector Search + Client-Side Country Filtering
 # ---------------------------------------------------------------------------
 
 async def get_safety_brief(
     country: str,
     query: str,
     top_k: int = 3,
-) -> list[str]:
+) -> tuple[list[str], str]:
     """Embed the *query* and retrieve the top-k most relevant chunks.
 
-    Uses Actian's filtered search: filter by country, sort by vector similarity.
+    Uses broad vector search + client-side country filtering because the
+    Actian beta's server-side payload filter is not yet functional.
 
-    Returns a list of content strings, or empty list if unavailable.
+    Returns a tuple of (content_list, status_message).
     """
     client = _get_cortex_client()
     if client is None:
-        return []
+        return [], "Actian VectorAI offline"
 
     try:
-        from cortex.filters import Filter, Field
-
         # Embed the query
         query_emb = await embed_text(query)
 
-        # Build country filter
-        country_filter = Filter().must(Field("country").eq(country))
+        # Broad search — fetch many results, then filter by country client-side
+        # (Actian beta's server-side Filter DSL does not filter payloads yet)
+        total = client.count(COLLECTION_NAME)
+        search_k = min(total, 200)  # cap at 200 to stay performant
 
-        # Filtered search — returns results sorted by similarity
-        results = client.search_filtered(
+        results = client.search(
             COLLECTION_NAME,
             query=query_emb,
-            search_filter=country_filter,
-            top_k=top_k,
+            top_k=search_k,
+            with_payload=True,
         )
 
-        # Retrieve payloads for each result
+        # Client-side country filter
         contents: list[str] = []
         for r in results:
-            try:
-                _, payload = client.get(COLLECTION_NAME, r.id)
-                if payload and "content" in payload:
-                    contents.append(payload["content"])
-            except Exception:
-                pass
+            if r.payload and r.payload.get("country") == country:
+                content = r.payload.get("content", "")
+                if content:
+                    contents.append(content)
+                if len(contents) >= top_k:
+                    break
+
+        if not contents:
+            return [], f"No safety context found in DB for {country}"
 
         logger.info(
             "get_safety_brief: %d results for '%s' in %s",
             len(contents), query[:50], country,
         )
-        return contents
+        return contents, "Actian VectorAI RAG"
 
     except Exception as exc:
         logger.error("get_safety_brief failed: %s", exc)
-        return []
+        return [], f"Actian error: {str(exc)}"
     finally:
-        client.close()
+        if client:
+            client.__exit__(None, None, None)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -517,7 +520,7 @@ async def get_safety_report(lat: float, lng: float) -> str:
     country = _coords_to_country(lat, lng)
 
     # Try Actian RAG first
-    results = await get_safety_brief(
+    results, status = await get_safety_brief(
         country, f"What are the security risks and safety conditions in {country}?"
     )
     if results:
@@ -525,12 +528,12 @@ async def get_safety_report(lat: float, lng: float) -> str:
         return (
             f"## Safety & Security Briefing — {country}\n"
             f"Coordinates: ({lat}, {lng})\n"
-            f"Source: Actian VectorAI RAG\n\n"
+            f"Source: {status}\n\n"
             + "\n\n---\n\n".join(sections)
         )
 
     # Fallback: fetch live data directly
-    logger.info("Actian unavailable — building live briefing for %s", country)
+    logger.info("RAG fallback (%s) — building live briefing for %s", status, country)
     gdacs_alerts = await fetch_gdacs_alerts(country)
     hdx_reports = await fetch_hdx_reports(country, limit=3)
 
@@ -552,13 +555,14 @@ async def get_safety_report(lat: float, lng: float) -> str:
     if not parts:
         return (
             f"No safety intelligence currently available for {country} "
-            f"({lat}, {lng}). Neither GDACS nor HDX returned results."
+            f"({lat}, {lng}). {status}. "
+            "Neither GDACS nor HDX returned results."
         )
 
     header = (
         f"## Safety & Security Briefing — {country}\n"
         f"Coordinates: ({lat}, {lng})\n"
-        f"*Live data — Actian VectorAI not configured*\n\n"
+        f"*Live data — {status}*\n\n"
     )
     return header + "\n".join(parts)
 
