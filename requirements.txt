@@ -6,3 +6,4 @@ osmnx
 openai
 requests
 Pillow
+networkx

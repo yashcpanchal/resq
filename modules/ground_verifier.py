@@ -8,8 +8,8 @@ Provides two strategies for each step of the verification pipeline:
   - ``fetch_satellite_image_esri``  — Esri World Imagery tiles (FREE, no key needed)
 
 **Visual Reasoning:**
-  - ``verify_ground_viability``         — OpenAI GPT-4o Vision (requires OPENAI_API_KEY, paid)
-  - ``verify_ground_viability_gemini``  — Google Gemini 2.0 Flash (FREE tier, requires GEMINI_API_KEY)
+  - ``verify_ground_viability``   — OpenAI GPT-4o Vision (requires OPENAI_API_KEY, paid)
+  - ``analyze_site_ollama``       — Local Ollama VLM (FREE, runs locally, no API key)
 """
 
 from __future__ import annotations
@@ -27,6 +27,9 @@ from openai import AsyncOpenAI
 
 logger = logging.getLogger(__name__)
 
+# ── Prompts ──────────────────────────────────────────────────────── #
+
+# Simple viability prompt (used by GPT-4o)
 SATELLITE_PROMPT = (
     "Analyze this satellite image of a location identified as '{site_name}' "
     "(category: {category}). "
@@ -37,6 +40,15 @@ SATELLITE_PROMPT = (
     '{{"viable": true/false, '
     '"reason": "<one-sentence explanation>", '
     '"confidence": <0.0-1.0>}}'
+)
+
+# Humanitarian aid analysis prompt (used by Ollama — plain text output)
+AID_ANALYSIS_PROMPT = (
+    "This is a satellite image of '{site_name}' ({category}). "
+    "Describe what you see and explain the best way to provide "
+    "humanitarian aid to this area. Consider: terrain and structures, "
+    "how to deliver supplies, where to set up a staging area, "
+    "and any visible risks or obstacles. Be concise."
 )
 
 
@@ -102,14 +114,14 @@ def _latlon_to_tile(lat: float, lng: float, zoom: int) -> tuple[int, int]:
 def fetch_satellite_image_esri(
     lat: float,
     lng: float,
-    zoom: int = 18,
-    grid: int = 3,
+    zoom: int = 17,
+    grid: int = 1,
 ) -> bytes:
     """Download satellite imagery from Esri World Imagery — **completely free**.
 
-    Stitches a *grid × grid* block of 256 px tiles centred on the
+    Fetches a *grid × grid* block of 256 px tiles centred on the
     coordinate, producing a ``(grid*256) × (grid*256)`` JPEG image
-    (default 768×768).
+    (default 256×256 with grid=1 for speed).
 
     No API key or account is required.  The tiles come from Esri's
     public ArcGIS World Imagery service.
@@ -117,8 +129,8 @@ def fetch_satellite_image_esri(
     Args:
         lat: Latitude of the target.
         lng: Longitude of the target.
-        zoom: Tile zoom level (18 ≈ building-level detail).
-        grid: Number of tiles per side to stitch (default 3 → 768 px).
+        zoom: Tile zoom level (17 ≈ neighbourhood detail, 18 ≈ building).
+        grid: Number of tiles per side (default 1 → 256 px, fast).
 
     Returns:
         Raw JPEG image bytes.
@@ -153,11 +165,37 @@ def fetch_satellite_image_esri(
 
 
 # ================================================================== #
-#  Visual Reasoning — OpenAI GPT-4o Vision (paid)                    #
+#  Image Preprocessing                                               #
+# ================================================================== #
+
+def _resize_for_vlm(image_bytes: bytes, max_dim: int = 384) -> bytes:
+    """Shrink an image so its longest side is at most *max_dim* pixels.
+
+    VLMs do not benefit from high-res input — 384 px is more than
+    enough for spatial reasoning while keeping payloads small and
+    inference fast.
+
+    Returns JPEG bytes (always, regardless of input format).
+    """
+    from PIL import Image  # lazy import
+
+    img = Image.open(io.BytesIO(image_bytes))
+    w, h = img.size
+    if max(w, h) > max_dim:
+        scale = max_dim / max(w, h)
+        img = img.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
+
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=80)
+    return buf.getvalue()
+
+
+# ================================================================== #
+#  JSON Parsing Helpers                                              #
 # ================================================================== #
 
 def _parse_vision_json(raw_text: str) -> dict[str, Any]:
-    """Parse a JSON response from a vision model, handling markdown fences."""
+    """Parse a simple viability JSON response (viable/reason/confidence)."""
     json_text = raw_text.strip()
     if json_text.startswith("```"):
         json_text = "\n".join(json_text.split("\n")[1:-1])
@@ -179,6 +217,85 @@ def _parse_vision_json(raw_text: str) -> dict[str, Any]:
     }
 
 
+def _parse_action_plan_json(raw_text: str) -> dict[str, Any]:
+    """Parse a full humanitarian action-plan JSON from the VLM.
+
+    Handles common VLM quirks:
+    - Leading/trailing whitespace or text
+    - Markdown ```json fences
+    - Fields returned as arrays instead of strings
+    """
+    import re
+
+    json_text = raw_text.strip()
+
+    # Remove markdown fences
+    if json_text.startswith("```"):
+        json_text = "\n".join(json_text.split("\n")[1:])
+    if json_text.endswith("```"):
+        json_text = json_text[: json_text.rfind("```")]
+
+    # Try to extract the first JSON object from the text
+    match = re.search(r"\{[\s\S]*\}", json_text)
+    if match:
+        json_text = match.group(0)
+
+    try:
+        result = json.loads(json_text)
+    except json.JSONDecodeError:
+        # Model returned plain text — use it as the terrain assessment
+        text = raw_text.strip()[:500]
+        if text:
+            logger.info("VLM returned plain text, using as terrain assessment")
+            return {
+                "viable": True,
+                "confidence": 0.5,
+                "terrain_assessment": text,
+                "access_routes": "See terrain assessment",
+                "staging_capacity": "Unknown — manual review needed",
+                "recommended_actions": [],
+                "risks": "Unknown — manual review needed",
+                "priority": "medium",
+                "reason": text[:200],
+            }
+        logger.warning("VLM returned empty response")
+        return {
+            "viable": False,
+            "confidence": 0.0,
+            "terrain_assessment": "No response from model",
+            "access_routes": "Unknown",
+            "staging_capacity": "Unknown",
+            "recommended_actions": [],
+            "risks": "Unknown",
+            "priority": "unknown",
+            "reason": "Model returned empty response",
+        }
+
+    def _to_str(val: Any, default: str = "Unknown") -> str:
+        """Coerce a value to string — join lists with ', '."""
+        if val is None:
+            return default
+        if isinstance(val, list):
+            return ", ".join(str(v) for v in val) if val else default
+        return str(val)
+
+    return {
+        "viable": bool(result.get("viable", False)),
+        "confidence": float(result.get("confidence", 0.0)),
+        "terrain_assessment": _to_str(result.get("terrain_assessment"), "Not assessed"),
+        "access_routes": _to_str(result.get("access_routes")),
+        "staging_capacity": _to_str(result.get("staging_capacity")),
+        "recommended_actions": list(result.get("recommended_actions", [])),
+        "risks": _to_str(result.get("risks")),
+        "priority": str(result.get("priority", "unknown")).lower(),
+        "reason": _to_str(result.get("reason"), "No summary provided"),
+    }
+
+
+# ================================================================== #
+#  Visual Reasoning — OpenAI GPT-4o Vision (paid)                    #
+# ================================================================== #
+
 async def verify_ground_viability(
     image_bytes: bytes,
     site_name: str,
@@ -195,7 +312,7 @@ async def verify_ground_viability(
     if not api_key:
         raise RuntimeError(
             "OPENAI_API_KEY is not set. "
-            "Add it to your .env, or use verify_ground_viability_gemini() instead."
+            "Add it to your .env, or use analyze_site_ollama() instead."
         )
 
     client = AsyncOpenAI(api_key=api_key)
@@ -227,71 +344,82 @@ async def verify_ground_viability(
 
 
 # ================================================================== #
-#  Visual Reasoning — Google Gemini Flash (FREE tier)                 #
+#  Visual Reasoning — Ollama Local VLM (FREE, runs locally)          #
 # ================================================================== #
 
-async def verify_ground_viability_gemini(
+async def analyze_site_ollama(
     image_bytes: bytes,
     site_name: str,
     category: str,
+    model: str = "moondream",
+    ollama_host: str | None = None,
 ) -> dict[str, Any]:
-    """Use **Google Gemini 2.0 Flash** to assess staging-ground suitability.
+    """Use a **local Ollama VLM** to analyze a site for humanitarian aid.
 
-    Requires ``GEMINI_API_KEY`` in env / .env.
-    Gemini Flash is **free** on the Google AI Studio free tier
-    (up to 15 RPM / 1 500 RPD as of 2025).
+    Sends the satellite image with a natural language prompt and returns
+    the model's plain-text analysis.  Runs entirely on your machine —
+    no API key, no cost, no data leaves your network.
 
-    Get a key at https://aistudio.google.com/apikey
+    Prerequisites:
+        1. Install Ollama: https://ollama.com
+        2. Pull a vision model:  ``ollama pull moondream``
+        3. Ollama server must be running (it auto-starts on install)
+
+    Args:
+        image_bytes: Raw satellite image (JPEG/PNG).
+        site_name: Human-readable name of the site.
+        category: OSM category tag (e.g. ``"amenity=school"``).
+        model: Ollama model name (default ``"moondream"``).
+        ollama_host: Ollama API base URL (default ``http://localhost:11434``).
 
     Returns:
-        ``{"viable": bool, "reason": str, "confidence": float}``
+        A dict::
+
+            {
+                "analysis": str,   # Plain-text humanitarian aid analysis
+            }
     """
-    api_key = os.getenv("GEMINI_API_KEY")
-    if not api_key:
-        raise RuntimeError(
-            "GEMINI_API_KEY is not set. "
-            "Get a free key at https://aistudio.google.com/apikey "
-            "and add it to your .env file."
-        )
+    host = ollama_host or os.getenv("OLLAMA_HOST", "http://localhost:11434")
+    url = f"{host}/api/generate"
 
-    b64_image = base64.b64encode(image_bytes).decode("utf-8")
-    prompt = SATELLITE_PROMPT.format(site_name=site_name, category=category)
-
-    # Use the Gemini REST API directly (avoids extra SDK dependency)
-    url = (
-        f"https://generativelanguage.googleapis.com/v1beta/models/"
-        f"gemini-2.0-flash:generateContent?key={api_key}"
-    )
+    # Resize image to 384px max dimension to speed up VLM processing
+    resized = _resize_for_vlm(image_bytes, max_dim=384)
+    b64_image = base64.b64encode(resized).decode("utf-8")
+    prompt = AID_ANALYSIS_PROMPT.format(site_name=site_name, category=category)
 
     payload = {
-        "contents": [
-            {
-                "parts": [
-                    {"text": prompt},
-                    {
-                        "inline_data": {
-                            "mime_type": "image/jpeg",
-                            "data": b64_image,
-                        }
-                    },
-                ]
-            }
-        ],
-        "generationConfig": {
-            "temperature": 0.1,
-            "maxOutputTokens": 300,
+        "model": model,
+        "prompt": prompt,
+        "images": [b64_image],
+        "stream": False,
+        "options": {
+            "temperature": 0.3,
+            "num_predict": 512,
         },
     }
 
-    resp = requests.post(url, json=payload, timeout=30)
-    resp.raise_for_status()
-    data = resp.json()
+    try:
+        resp = requests.post(url, json=payload, timeout=120)
+        resp.raise_for_status()
+    except requests.ConnectionError:
+        raise RuntimeError(
+            f"Cannot connect to Ollama at {host}. "
+            "Make sure Ollama is installed and running: https://ollama.com"
+        )
+    except requests.HTTPError as exc:
+        if resp.status_code == 404:
+            raise RuntimeError(
+                f"Model '{model}' not found in Ollama. "
+                f"Pull it first:  ollama pull {model}"
+            )
+        raise RuntimeError(f"Ollama request failed: {exc}")
 
-    raw_text = (
-        data.get("candidates", [{}])[0]
-        .get("content", {})
-        .get("parts", [{}])[0]
-        .get("text", "")
+    data = resp.json()
+    raw_text = data.get("response", "").strip()
+    logger.info(
+        "Ollama (%s) analyzed '%s' — %d chars response",
+        model, site_name, len(raw_text),
     )
 
-    return _parse_vision_json(raw_text)
+    return {"analysis": raw_text or "No analysis generated"}
+

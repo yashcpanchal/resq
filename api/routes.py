@@ -9,6 +9,8 @@ from __future__ import annotations
 from fastapi import APIRouter
 
 from api.schemas import (
+    AidSiteRequest,
+    AidSiteResponse,
     MemoRequest,
     MemoResponse,
     NeglectScore,
@@ -16,14 +18,12 @@ from api.schemas import (
     ParkingResponse,
     SafetyRequest,
     SafetyResponse,
-    StagingRequest,
-    StagingResponse,
 )
 from modules.pipeline import get_neglect_scores
 from modules.vision import get_parking_capacity
 from modules.vector import get_safety_report
 from modules.synthesis import generate_memo
-from modules.candidate_verification import evaluate_staging_grounds
+from modules.candidate_verification import find_aid_sites
 
 router = APIRouter()
 
@@ -71,10 +71,31 @@ async def memo(req: MemoRequest):
     return MemoResponse(crisis_id=req.crisis_id, memo=text)
 
 
-# ---- Visionary (Staging Grounds) ---- #
+# ---- Humanitarian Aid Sites ---- #
 
-@router.post("/staging-grounds", response_model=StagingResponse)
-async def staging_grounds(req: StagingRequest):
-    """Find and verify staging grounds near given coordinates."""
-    candidates = await evaluate_staging_grounds(req.lat, req.lng, req.radius_m)
-    return StagingResponse(lat=req.lat, lng=req.lng, candidates=candidates)
+@router.post("/aid-sites", response_model=AidSiteResponse)
+async def aid_sites(req: AidSiteRequest):
+    """Find nearby humanitarian aid sites and generate action plans.
+
+    Takes a lat/lng coordinate and searches for schools, hospitals,
+    parks, and open land within the given radius. For each site,
+    fetches satellite imagery and uses a local Ollama VLM to generate
+    a humanitarian aid action plan.
+    """
+    sites = await find_aid_sites(
+        lat=req.lat,
+        lng=req.lng,
+        radius_m=req.radius_m,
+        max_sites=req.max_sites,
+        model=req.model,
+    )
+    analyzed_sites = [s for s in sites if "Not analyzed" not in s.get("analysis", "")]
+    return AidSiteResponse(
+        lat=req.lat,
+        lng=req.lng,
+        radius_m=req.radius_m,
+        total_candidates=len(sites),
+        analyzed_candidates=len(analyzed_sites),
+        sites=analyzed_sites,
+    )
+

@@ -70,26 +70,30 @@ class MemoResponse(BaseModel):
     memo: str
 
 
-# ---------- Visionary (Staging Grounds) ---------- #
+# ---------- Visionary (Humanitarian Aid Sites) ---------- #
 
-class StagingRequest(BaseModel):
+class AidSiteRequest(BaseModel):
     lat: float
     lng: float
-    radius_m: int = Field(default=2000, ge=100, le=10000)
+    radius_m: int = Field(default=5000, ge=100, le=20000)
+    max_sites: int = Field(default=10, ge=1, le=50)
+    model: str = Field(default="moondream", description="Ollama vision model name")
 
 
-class StagingCandidate(BaseModel):
+class AidSiteCandidate(BaseModel):
     name: str
     category: str
     lat: float
     lng: float
     osm_id: str
-    viable: bool
-    reason: str
-    confidence: float = Field(..., ge=0.0, le=1.0)
+    analysis: str = ""
 
 
-class StagingResponse(BaseModel):
+class AidSiteResponse(BaseModel):
     lat: float
     lng: float
-    candidates: list[StagingCandidate]
+    radius_m: int
+    total_candidates: int
+    analyzed_candidates: int
+    sites: list[AidSiteCandidate]
+
