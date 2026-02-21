@@ -1,7 +1,7 @@
 """
 Layer 3 — Context Engine (Safety Intelligence via RAG)
 
-Pipeline: GDACS + HDX → chunk → embed (Gemini) → store (Actian VectorAI) → search.
+Pipeline: GDACS + HDX → chunk → embed (OpenRouter) → store (Actian VectorAI) → search.
 
 Actian VectorAI DB integration uses the ``cortex`` gRPC Python client
 (not SQL / pyodbc).  Docker: ``docker compose up -d`` in actian-beta/.
@@ -33,7 +33,9 @@ HDX_HAPI_URL = "https://hapi.humdata.org/api/v2"
 STATE_DEPT_ADVISORIES_URL = "https://cadataapi.state.gov/api/TravelAdvisories"
 STATE_DEPT_COUNTRY_URL = "https://cadataapi.state.gov/api/CountryTravelInformation"
 GOOGLE_NEWS_RSS_URL = "https://news.google.com/rss/search"
-EMBEDDING_MODEL = "models/gemini-embedding-001"
+OPENROUTER_API_BASE = "https://openrouter.ai/api/v1"
+OPENROUTER_EMBED_MODEL = os.getenv("OPENROUTER_EMBED_MODEL", "openai/text-embedding-3-large")
+OPENROUTER_CHAT_MODEL = os.getenv("OPENROUTER_CHAT_MODEL", "arcee-ai/trinity-large-preview:free")
 EMBEDDING_DIM = 3072
 CHUNK_MAX_TOKENS = 500
 CHUNK_OVERLAP_TOKENS = 50
@@ -72,26 +74,44 @@ async def _country_to_coords(country: str) -> tuple[float, float] | None:
         return None
 
 
-async def _coords_to_country(lat: float, lng: float) -> str:
-    """Reverse-geocode (lat, lng) to a country name via Nominatim HTTP API."""
+async def _coords_to_location(lat: float, lng: float) -> dict[str, str]:
+    """Reverse-geocode (lat, lng) to country, city, and region via Nominatim.
+
+    Returns {"country": ..., "city": ..., "region": ...}. Values default to "".
+    """
+    loc: dict[str, str] = {"country": "", "city": "", "region": ""}
     try:
         async with httpx.AsyncClient(timeout=10) as client:
             resp = await client.get(
                 NOMINATIM_REVERSE,
-                params={"lat": lat, "lon": lng, "format": "jsonv2", "accept-language": "en"},
+                params={"lat": lat, "lon": lng, "format": "jsonv2", "accept-language": "en",
+                        "zoom": 10},
                 headers={"User-Agent": "ResQ-Capital/0.1"},
             )
             resp.raise_for_status()
             data = resp.json()
-            country = data.get("address", {}).get("country", "")
-            if country:
-                logger.info("Reverse Geocode: (%s, %s) -> %s", lat, lng, country)
-                return country
-        logger.warning("Nominatim returned no country for (%s, %s)", lat, lng)
-        return "Unknown"
+            addr = data.get("address", {})
+            loc["country"] = addr.get("country", "")
+            loc["city"] = (
+                addr.get("city", "")
+                or addr.get("town", "")
+                or addr.get("village", "")
+                or addr.get("municipality", "")
+            )
+            loc["region"] = addr.get("state", "") or addr.get("region", "")
+            logger.info(
+                "Reverse Geocode: (%s, %s) -> %s / %s / %s",
+                lat, lng, loc["country"], loc["region"], loc["city"],
+            )
     except Exception as exc:
         logger.error("Reverse geocoding failed: %s", exc)
-        return "Unknown"
+    return loc
+
+
+async def _coords_to_country(lat: float, lng: float) -> str:
+    """Reverse-geocode (lat, lng) to a country name."""
+    loc = await _coords_to_location(lat, lng)
+    return loc["country"] or "Unknown"
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -179,38 +199,12 @@ async def fetch_gdacs_alerts(country: str, min_level: str = "Orange") -> list[di
 
 
 # ---------------------------------------------------------------------------
-# Country-code mappings (ISO3 for HDX, 2-letter for State Dept, ISO3 upper for HAPI)
+# Country-code mappings (from modules.country_codes)
 # ---------------------------------------------------------------------------
 
-_COUNTRY_TO_ISO3: dict[str, str] = {
-    "afghanistan": "afg", "bangladesh": "bgd", "burkina faso": "bfa",
-    "central african republic": "caf", "chad": "tcd", "colombia": "col",
-    "democratic republic of the congo": "cod", "drc": "cod",
-    "egypt": "egy", "ethiopia": "eth", "haiti": "hti", "india": "ind",
-    "iraq": "irq", "iran": "irn", "jordan": "jor", "kenya": "ken",
-    "lebanon": "lbn", "libya": "lby", "mali": "mli", "mozambique": "moz",
-    "myanmar": "mmr", "niger": "ner", "nigeria": "nga", "pakistan": "pak",
-    "palestine": "pse", "somalia": "som", "south sudan": "ssd",
-    "sudan": "sdn", "syria": "syr", "turkey": "tur", "turkiye": "tur",
-    "ukraine": "ukr", "venezuela": "ven", "yemen": "yem",
-    "china": "chn", "nepal": "npl", "philippines": "phl",
-    "indonesia": "idn", "japan": "jpn", "mexico": "mex", "brazil": "bra",
-}
+from modules.country_codes import build_country_maps, list_all_countries
 
-_COUNTRY_TO_STATE_DEPT: dict[str, str] = {
-    "afghanistan": "AF", "bangladesh": "BG", "burkina faso": "UV",
-    "central african republic": "CT", "chad": "CD", "colombia": "CO",
-    "democratic republic of the congo": "CG", "drc": "CG",
-    "egypt": "EG", "ethiopia": "ET", "haiti": "HA", "india": "IN",
-    "iraq": "IZ", "iran": "IR", "jordan": "JO", "kenya": "KE",
-    "lebanon": "LE", "libya": "LY", "mali": "ML", "mozambique": "MZ",
-    "myanmar": "BM", "niger": "NG", "nigeria": "NI", "pakistan": "PK",
-    "palestine": "GZ", "somalia": "SO", "south sudan": "OD",
-    "sudan": "SU", "syria": "SY", "turkey": "TU", "turkiye": "TU",
-    "ukraine": "UP", "venezuela": "VE", "yemen": "YM",
-    "china": "CH", "nepal": "NP", "philippines": "RP",
-    "indonesia": "ID", "japan": "JA", "mexico": "MX", "brazil": "BR",
-}
+_COUNTRY_TO_ISO3, _COUNTRY_TO_STATE_DEPT = build_country_maps()
 
 _HAPI_APP_ID = base64.b64encode(b"ResQ-Capital:resq@resqcapital.org").decode()
 
@@ -556,6 +550,122 @@ async def fetch_news(country: str, max_articles: int = 10) -> list[dict[str, Any
     return articles
 
 
+async def fetch_city_news(city: str, country: str, max_articles: int = 5) -> list[dict[str, Any]]:
+    """Fetch news specifically about a city/region within a country."""
+    if not city:
+        return []
+    queries = [
+        f'"{city}" "{country}" conflict OR violence OR attack OR security when:7d',
+        f'"{city}" "{country}" crisis OR emergency OR disaster when:7d',
+    ]
+
+    articles: list[dict[str, Any]] = []
+    seen_titles: set[str] = set()
+
+    async with httpx.AsyncClient(timeout=15) as client:
+        for q in queries:
+            try:
+                resp = await client.get(
+                    GOOGLE_NEWS_RSS_URL,
+                    params={"q": q, "hl": "en-US", "gl": "US", "ceid": "US:en"},
+                    headers={"User-Agent": "ResQ-Capital/0.1"},
+                )
+                resp.raise_for_status()
+                root = ET.fromstring(resp.text)
+                for item in root.findall(".//item"):
+                    title = (item.findtext("title", "") or "").strip()
+                    if not title or title in seen_titles:
+                        continue
+                    seen_titles.add(title)
+                    pub_date = item.findtext("pubDate", "")
+                    source = item.findtext("source", "")
+                    desc_raw = item.findtext("description", "")
+                    desc_clean = re.sub(r"<[^>]+>", " ", desc_raw)
+                    desc_clean = re.sub(r"\s+", " ", desc_clean).strip()
+
+                    articles.append({
+                        "title": title,
+                        "body": (
+                            f"[LOCAL NEWS — {city}, {country}] {title} "
+                            f"(Source: {source}, {pub_date}). {desc_clean}"
+                        ),
+                        "source": source or "Google News",
+                        "date": pub_date,
+                        "country": country,
+                    })
+                    if len(articles) >= max_articles:
+                        break
+            except (httpx.HTTPError, ET.ParseError) as exc:
+                logger.warning("City news query failed for %s: %s", city, exc)
+            if len(articles) >= max_articles:
+                break
+
+    logger.info("City News: found %d articles for %s, %s", len(articles), city, country)
+    return articles
+
+
+def _haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Approximate distance in km between two coordinates."""
+    import math
+    R = 6371.0
+    dlat = math.radians(lat2 - lat1)
+    dlon = math.radians(lon2 - lon1)
+    a = math.sin(dlat / 2) ** 2 + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * math.sin(dlon / 2) ** 2
+    return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+
+
+async def fetch_gdacs_nearby(lat: float, lng: float, radius_km: float = 500) -> list[dict[str, Any]]:
+    """Fetch GDACS alerts near (lat, lng) regardless of country — proximity-based."""
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            resp = await client.get(GDACS_RSS_URL, headers={"User-Agent": "ResQ-Capital/0.1"})
+            resp.raise_for_status()
+    except httpx.HTTPError as exc:
+        logger.warning("GDACS RSS unavailable: %s", exc)
+        return []
+
+    try:
+        root = ET.fromstring(resp.text)
+    except ET.ParseError:
+        return []
+
+    nearby: list[dict[str, Any]] = []
+    for item in root.findall(".//item"):
+        try:
+            geo_lat = float(item.findtext("{http://www.w3.org/2003/01/geo/wgs84_pos#}lat", "0"))
+            geo_lng = float(item.findtext("{http://www.w3.org/2003/01/geo/wgs84_pos#}long", "0"))
+        except (ValueError, TypeError):
+            continue
+        if geo_lat == 0.0 and geo_lng == 0.0:
+            continue
+        dist = _haversine_km(lat, lng, geo_lat, geo_lng)
+        if dist > radius_km:
+            continue
+
+        alert_level = item.findtext("gdacs:alertlevel", default="", namespaces=GDACS_NS)
+        title = item.findtext("title", default="")
+        description = re.sub(r"<[^>]+>", " ", item.findtext("description", ""))
+        description = re.sub(r"\s+", " ", description).strip()
+        event_type_code = item.findtext("gdacs:eventtype", default="", namespaces=GDACS_NS)
+        event_type = _EVENT_TYPE_LABELS.get(event_type_code, event_type_code)
+        severity = item.findtext("gdacs:severity", default="", namespaces=GDACS_NS)
+
+        nearby.append({
+            "title": title,
+            "body": (
+                f"[NEARBY DISASTER — {int(dist)}km away] GDACS [{alert_level.upper()}] "
+                f"{event_type}. Severity: {severity}. {title}. {description}"
+            ),
+            "source": "GDACS",
+            "date": item.findtext("pubDate", ""),
+            "distance_km": dist,
+        })
+
+    nearby.sort(key=lambda x: x.get("distance_km", 9999))
+    logger.info("GDACS nearby: %d alerts within %dkm of (%s, %s)", len(nearby), radius_km, lat, lng)
+    return nearby[:5]
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 #  SECTION 2 — TEXT CHUNKING
 # ═══════════════════════════════════════════════════════════════════════════
@@ -589,56 +699,57 @@ def chunk_text(
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  SECTION 3 — GEMINI EMBEDDINGS (via REST API — no SDK dependency)
+#  SECTION 3 — EMBEDDINGS (OpenRouter)
 # ═══════════════════════════════════════════════════════════════════════════
 
-GEMINI_EMBED_URL = (
-    "https://generativelanguage.googleapis.com/v1beta/{model}:embedContent"
-)
-GEMINI_BATCH_URL = (
-    "https://generativelanguage.googleapis.com/v1beta/{model}:batchEmbedContents"
-)
 
-
-def _gemini_api_key() -> str | None:
-    return os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
+def _openrouter_api_key() -> str | None:
+    return os.getenv("OPENROUTER_API_KEY") or None
 
 
 async def embed_text(text: str) -> list[float]:
-    """Return the embedding vector for *text* using Gemini gemini-embedding-001."""
-    api_key = _gemini_api_key()
-    if not api_key:
-        logger.warning("GEMINI_API_KEY not set — returning zero vector")
+    """Return the embedding vector for *text* via OpenRouter."""
+    key = _openrouter_api_key()
+    if not key:
+        logger.warning("OPENROUTER_API_KEY not set — returning zero vector")
         return [0.0] * EMBEDDING_DIM
-
-    url = GEMINI_EMBED_URL.format(model=EMBEDDING_MODEL)
-    body = {"model": EMBEDDING_MODEL, "content": {"parts": [{"text": text}]}}
-
     async with httpx.AsyncClient(timeout=30) as client:
-        resp = await client.post(url, params={"key": api_key}, json=body)
+        resp = await client.post(
+            f"{OPENROUTER_API_BASE}/embeddings",
+            headers={"Authorization": f"Bearer {key}"},
+            json={"model": OPENROUTER_EMBED_MODEL, "input": text},
+        )
         resp.raise_for_status()
-        return resp.json()["embedding"]["values"]
+        return resp.json()["data"][0]["embedding"]
 
 
 async def embed_texts(texts: list[str]) -> list[list[float]]:
-    """Batch embed multiple texts using Gemini gemini-embedding-001."""
-    api_key = _gemini_api_key()
-    if not api_key:
-        logger.warning("GEMINI_API_KEY not set — returning zero vectors")
+    """Batch embed multiple texts via OpenRouter. Retries on 429."""
+    key = _openrouter_api_key()
+    if not key:
+        logger.warning("OPENROUTER_API_KEY not set — returning zero vectors")
         return [[0.0] * EMBEDDING_DIM for _ in texts]
-
-    url = GEMINI_BATCH_URL.format(model=EMBEDDING_MODEL)
-    requests = [
-        {"model": EMBEDDING_MODEL, "content": {"parts": [{"text": t}]}}
-        for t in texts
-    ]
-
-    async with httpx.AsyncClient(timeout=60) as client:
-        resp = await client.post(
-            url, params={"key": api_key}, json={"requests": requests},
-        )
-        resp.raise_for_status()
-        return [e["values"] for e in resp.json()["embeddings"]]
+    delays = [30, 60, 90]
+    async with httpx.AsyncClient(timeout=120) as client:
+        for attempt, delay in enumerate(delays):
+            try:
+                resp = await client.post(
+                    f"{OPENROUTER_API_BASE}/embeddings",
+                    headers={"Authorization": f"Bearer {key}"},
+                    json={"model": OPENROUTER_EMBED_MODEL, "input": texts},
+                )
+                resp.raise_for_status()
+                return [item["embedding"] for item in resp.json()["data"]]
+            except httpx.HTTPStatusError as exc:
+                if exc.response.status_code == 429 and attempt < len(delays) - 1:
+                    logger.warning(
+                        "OpenRouter embedding 429 — waiting %ds then retry (attempt %d)",
+                        delay, attempt + 1,
+                    )
+                    await asyncio.sleep(delay)
+                    continue
+                raise
+    return [[0.0] * EMBEDDING_DIM for _ in texts]
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -683,7 +794,7 @@ def init_db(client=None) -> bool:
     """Create the ``safety_intelligence`` collection if it doesn't exist.
 
     Collection schema:
-        - dimension: 3072 (Gemini gemini-embedding-001)
+        - dimension: 3072 (openai/text-embedding-3-large via OpenRouter)
         - distance_metric: COSINE
         - payload fields: country (str), content (str)
 
@@ -754,7 +865,7 @@ async def ingest_intelligence(
         except Exception:
             _next_id = 0
 
-        # Generate embeddings via Gemini
+        # Generate embeddings via OpenRouter
         embeddings = await embed_texts(text_list)
 
         # Prepare batch data
@@ -808,13 +919,12 @@ async def get_safety_brief(
         return [], "Actian VectorAI offline"
 
     try:
-        # Embed the query
-        query_emb = await embed_text(query)
-
-        # Broad search — fetch many results, then filter by country client-side
-        # (Actian beta's server-side Filter DSL does not filter payloads yet)
         total = client.count(COLLECTION_NAME)
-        search_k = min(total, 200)  # cap at 200 to stay performant
+        if total == 0:
+            return [], "No data in DB"
+
+        query_emb = await embed_text(query)
+        search_k = min(total, 200)
 
         results = client.search(
             COLLECTION_NAME,
@@ -851,12 +961,8 @@ async def get_safety_brief(
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  SECTION 5 — GEMINI GENERATION (synthesize intelligence from chunks)
+#  SECTION 5 — GENERATION (OpenRouter)
 # ═══════════════════════════════════════════════════════════════════════════
-
-GEMINI_GENERATE_URL = (
-    "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent"
-)
 
 _BRIEFING_SYSTEM_PROMPT = """\
 You are an operational intelligence analyst writing field briefings for \
@@ -891,12 +997,20 @@ but things like "RSF drone strikes on Kordofan aid convoys (20 Feb)" or \
 "Cholera outbreak in Kassala state" or "Checkpoint extortion on Khartoum-Port \
 Sudan highway." Each risk should name a PLACE and a THREAT.
 
+## Local Situation (if city/region specified)
+If a specific city or region is given, include a focused subsection:
+- What is happening in and around that specific location right now?
+- Local threats, recent incidents, infrastructure status.
+- Nearby natural disasters (items tagged [NEARBY DISASTER]).
+- If no local data is available, say so briefly.
+
 ## Operational Recommendations
 Practical, specific advice: communication protocols, supply chain \
 considerations, evacuation routes, coordination contacts, medical prep. \
 NOT generic "stay alert" — things like "Maintain HF radio capability as \
 mobile networks are down in Darfur" or "Coordinate movements through OCHA \
-access working group."
+access working group." If a specific city is given, tailor recommendations \
+to that location.
 
 RULES:
 - Discard information about other countries.
@@ -907,43 +1021,52 @@ RULES:
 """
 
 
-async def _gemini_generate(prompt: str, *, max_tokens: int = 1200) -> str | None:
-    """Call Gemini to generate text with retry on rate-limit (429)."""
-    api_key = _gemini_api_key()
-    if not api_key:
+async def _openrouter_generate(prompt: str, *, max_tokens: int = 1200) -> str | None:
+    """Call OpenRouter chat completions with retry on 429."""
+    key = _openrouter_api_key()
+    if not key:
         return None
-
     body = {
-        "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {
-            "temperature": 0.3,
-            "maxOutputTokens": max_tokens,
-        },
+        "model": OPENROUTER_CHAT_MODEL,
+        "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": max_tokens,
+        "temperature": 0.3,
     }
-
     delays = [5, 15, 30]
     async with httpx.AsyncClient(timeout=60) as client:
         for attempt, delay in enumerate(delays):
             try:
                 resp = await client.post(
-                    GEMINI_GENERATE_URL,
-                    params={"key": api_key},
+                    f"{OPENROUTER_API_BASE}/chat/completions",
+                    headers={"Authorization": f"Bearer {key}"},
                     json=body,
                 )
                 resp.raise_for_status()
                 data = resp.json()
-                return data["candidates"][0]["content"]["parts"][0]["text"]
+                return data["choices"][0]["message"]["content"]
             except httpx.HTTPStatusError as exc:
+                try:
+                    err_body = exc.response.text[:500] if exc.response else ""
+                    logger.error(
+                        "OpenRouter generation HTTP %s: %s",
+                        exc.response.status_code if exc.response else "?",
+                        err_body,
+                    )
+                except Exception:
+                    logger.error("OpenRouter generation failed: %s", exc)
                 if exc.response.status_code == 429 and attempt < len(delays) - 1:
-                    logger.warning("Gemini 429 — retrying in %ds (attempt %d)", delay, attempt + 1)
                     await asyncio.sleep(delay)
                     continue
-                logger.error("Gemini generation failed: %s", exc)
                 return None
             except Exception as exc:
-                logger.error("Gemini generation failed: %s", exc)
+                logger.error("OpenRouter generation failed: %s", exc)
                 return None
     return None
+
+
+async def _llm_generate(prompt: str, *, max_tokens: int = 1200) -> str | None:
+    """Generate text via OpenRouter."""
+    return await _openrouter_generate(prompt, max_tokens=max_tokens)
 
 
 async def synthesize_briefing(
@@ -951,38 +1074,53 @@ async def synthesize_briefing(
     chunks: list[str],
     lat: float | None = None,
     lng: float | None = None,
+    city: str = "",
+    region: str = "",
 ) -> str:
-    """Use Gemini to synthesize retrieved chunks into an actionable briefing.
+    """Use LLM (OpenRouter) to synthesize retrieved chunks into an actionable briefing.
 
-    Falls back to formatted raw chunks if Gemini is unavailable.
+    Falls back to formatted raw chunks if LLM is unavailable.
     """
-    context = "\n\n---\n\n".join(c[:2000] for c in chunks[:10])
+    context = "\n\n---\n\n".join(c[:2000] for c in chunks[:15])
 
     coord_str = f"Coordinates: ({lat}, {lng})\n" if lat is not None else ""
+    location_parts = [p for p in [city, region, country] if p]
+    location_label = ", ".join(location_parts) if location_parts else country
+
+    location_note = ""
+    if city or region:
+        location_note = (
+            f"\nSPECIFIC LOCATION: {location_label}\n"
+            f"Prioritize intel about {city or region} and its immediate surroundings. "
+            f"Items tagged [LOCAL NEWS] or [NEARBY DISASTER] are specific to this "
+            f"location — give them extra weight. Also include country-level context "
+            f"that affects this area.\n"
+        )
+
     prompt = (
         f"{_BRIEFING_SYSTEM_PROMPT}\n\n"
-        f"TARGET COUNTRY: {country}\n{coord_str}\n"
+        f"TARGET COUNTRY: {country}\n{coord_str}{location_note}\n"
         f"RETRIEVED INTELLIGENCE ({len(chunks)} chunks):\n\n{context}\n\n"
         f"Write the operational field briefing now. Remember: the reader is "
-        f"deploying to {country} regardless — help them operate safely, "
+        f"deploying to {location_label} regardless — help them operate safely, "
         f"not decide whether to go."
     )
 
-    generated = await _gemini_generate(prompt)
+    generated = await _llm_generate(prompt)
 
     if generated:
         header = (
-            f"## Operational Field Briefing — {country}\n"
+            f"## Operational Field Briefing — {location_label}\n"
             f"{coord_str}"
-            f"*Intel from GDACS, HDX, US State Dept, HAPI & live news — synthesized via Gemini*\n\n"
+            f"*Intel from GDACS, HDX, US State Dept, HAPI & live news — synthesized via LLM*\n\n"
         )
         return header + generated
 
     sections = [f"[{i}] {text[:1500]}" for i, text in enumerate(chunks, 1)]
     return (
-        f"## Safety & Security Briefing — {country}\n"
+        f"## Safety & Security Briefing — {location_label}\n"
         f"{coord_str}"
-        f"Source: Raw retrieved data (Gemini unavailable)\n\n"
+        f"Source: Raw retrieved data (LLM unavailable)\n\n"
         + "\n\n---\n\n".join(sections)
     )
 
@@ -1029,42 +1167,89 @@ async def ingest_country(country: str, limit: int = 10) -> int:
     return stored
 
 
+async def ingest_all_countries(
+    delay_seconds: float = 6.0,
+    countries: list[str] | None = None,
+) -> dict[str, Any]:
+    """Ingest every country in the codebook. Optional delay between countries to reduce rate limits.
+
+    Returns a summary: {"ingested": n, "total_chunks": sum, "by_country": {country: chunks}}.
+    """
+    if countries is None:
+        countries = list_all_countries()
+    total_chunks = 0
+    by_country: dict[str, int] = {}
+    for i, country in enumerate(countries, 1):
+        try:
+            n = await ingest_country(country)
+            by_country[country] = n
+            total_chunks += n
+            logger.info("Ingest-all %d/%d: %s -> %d chunks", i, len(countries), country, n)
+        except Exception as exc:
+            logger.exception("Ingest-all failed for %s: %s", country, exc)
+            by_country[country] = 0
+        if i < len(countries):
+            await asyncio.sleep(delay_seconds)
+    return {"ingested": len(countries), "total_chunks": total_chunks, "by_country": by_country}
+
+
 async def get_safety_report(lat: float, lng: float) -> str:
     """Return a safety/security briefing for (*lat*, *lng*).
 
-    1. Reverse-geocode to country name.
-    2. Fetch breaking news (always live — never stale).
-    3. Try Actian RAG for deeper context -> Gemini synthesis.
-    4. Fallback: live all-source fetch -> Gemini synthesis.
+    1. Reverse-geocode to country + city/region.
+    2. Fetch city-specific news + nearby GDACS alerts (always live).
+    3. Fetch country-level news (always live).
+    4. Try Actian RAG for deeper country context.
+    5. Merge city-level + country-level chunks -> LLM synthesis.
+    6. Fallback: live all-source fetch + city data -> LLM synthesis.
     """
-    country = await _coords_to_country(lat, lng)
+    loc = await _coords_to_location(lat, lng)
+    country = loc["country"] or "Unknown"
+    city = loc["city"]
+    region = loc["region"]
+    location_label = ", ".join(filter(None, [city, region, country]))
 
-    news_task = fetch_news(country, max_articles=5)
+    # Kick off city-specific + country-level fetches in parallel
+    city_news_task = fetch_city_news(city, country, max_articles=5)
+    nearby_gdacs_task = fetch_gdacs_nearby(lat, lng, radius_km=500)
+    country_news_task = fetch_news(country, max_articles=5)
 
-    results, status = await get_safety_brief(
+    rag_results, status = await get_safety_brief(
         country, f"security risks safety humanitarian situation in {country}",
         top_k=5,
     )
 
-    news_articles = await news_task
-    news_chunks = [a["body"] for a in news_articles[:5]]
+    city_news, nearby_gdacs, country_news = await asyncio.gather(
+        city_news_task, nearby_gdacs_task, country_news_task,
+    )
 
-    if results:
-        combined_chunks = news_chunks + results
-        return await synthesize_briefing(country, combined_chunks, lat, lng)
+    # City-level chunks go first (highest priority)
+    city_chunks: list[str] = []
+    for a in city_news[:5]:
+        city_chunks.append(a["body"])
+    for a in nearby_gdacs[:3]:
+        city_chunks.append(a["body"])
+
+    country_news_chunks = [a["body"] for a in country_news[:5]]
+
+    if rag_results:
+        combined = city_chunks + country_news_chunks + rag_results
+        return await synthesize_briefing(
+            country, combined, lat, lng,
+            city=city, region=region,
+        )
 
     logger.info("RAG fallback (%s) — live fetch for %s", status, country)
-    results = await asyncio.gather(
+    live_results = await asyncio.gather(
         fetch_gdacs_alerts(country, min_level="Green"),
         fetch_hdx_reports(country, limit=5),
         fetch_travel_advisory(country),
         fetch_hapi_data(country),
-        fetch_news(country, max_articles=5),
     )
-    gdacs_alerts, hdx_reports, state_reports, hapi_reports, news_articles = results
+    gdacs_alerts, hdx_reports, state_reports, hapi_reports = live_results
 
-    chunks: list[str] = []
-    for item in news_articles[:5]:
+    chunks: list[str] = city_chunks[:]
+    for item in country_news[:5]:
         chunks.append(item["body"])
     for item in state_reports[:5]:
         chunks.append(item["body"])
@@ -1077,12 +1262,15 @@ async def get_safety_report(lat: float, lng: float) -> str:
 
     if not chunks:
         return (
-            f"No safety intelligence currently available for {country} "
+            f"No safety intelligence currently available for {location_label} "
             f"({lat}, {lng}). {status}. "
-            "No sources returned results for this country."
+            "No sources returned results for this location."
         )
 
-    return await synthesize_briefing(country, chunks, lat, lng)
+    return await synthesize_briefing(
+        country, chunks, lat, lng,
+        city=city, region=region,
+    )
 
 
 async def get_safety_report_by_country(country: str) -> tuple[str, float | None, float | None]:
@@ -1140,7 +1328,7 @@ async def _run_pipeline(country: str) -> None:
         print(f"  Actian unavailable — {len(text_list)} chunks ready but not stored")
         print(f"  Start Docker: cd actian-beta && docker compose up -d")
 
-    print(f"\n[Step 3] Generating safety briefing (Gemini synthesis)...")
+    print(f"\n[Step 3] Generating safety briefing (LLM synthesis)...")
     report = await get_safety_report_by_country(country)
     print(report[0])
 

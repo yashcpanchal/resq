@@ -6,7 +6,7 @@ Each route delegates to the corresponding module in modules/.
 
 from __future__ import annotations
 
-from fastapi import APIRouter
+from fastapi import APIRouter, BackgroundTasks
 
 from api.schemas import (
     IngestRequest,
@@ -25,7 +25,12 @@ from modules.pipeline import get_neglect_scores
 from modules.vision import get_parking_capacity
 from modules.vector import get_safety_report
 from modules.synthesis import generate_memo
-from modules.context_engine import ingest_country, get_safety_report_by_country
+from modules.context_engine import (
+    ingest_country,
+    ingest_all_countries,
+    get_safety_report_by_country,
+)
+from modules.country_codes import list_all_countries
 
 router = APIRouter()
 
@@ -80,6 +85,20 @@ async def ingest_reports(req: IngestRequest):
     """Ingest GDACS, HDX, US State Dept, HAPI and news for a country into Actian VectorAI."""
     count = await ingest_country(req.country)
     return IngestResponse(country=req.country, chunks_ingested=count)
+
+
+@router.get("/countries")
+async def countries_list():
+    """Return all country names supported for ingest and safety reports."""
+    return {"countries": list_all_countries()}
+
+
+@router.post("/ingest-reports-all", status_code=202)
+async def ingest_reports_all(background_tasks: BackgroundTasks):
+    """Start ingesting all countries in the background (delay 6s between each). Check server logs for progress."""
+    n = len(list_all_countries())
+    background_tasks.add_task(ingest_all_countries, 6.0, None)
+    return {"message": f"Started ingesting {n} countries in background. Check server logs for progress."}
 
 
 @router.post("/safety-report-by-country", response_model=SafetyByCountryResponse)

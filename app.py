@@ -4,6 +4,7 @@ ResQ-Capital — FastAPI Entry Point
 Start with:  uvicorn app:app --reload
 """
 
+import logging
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -15,6 +16,8 @@ from api.routes import router
 _STATIC = Path(__file__).parent / "static"
 
 load_dotenv()
+
+logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(name)s — %(message)s")
 
 app = FastAPI(
     title="ResQ-Capital API",

@@ -22,7 +22,7 @@
             </Step>
             
             <Step order="2" phase="Validation" source="modules/context_engine.py + modules/vector.py (Actian)" trigger="On-Demand API Call">
-                When a user selects a crisis or country, FastAPI triggers: (1) live Google News fetch for breaking news; (2) vector search in Actian for stored intel (GDACS, HDX, State Dept, HAPI); (3) Gemini synthesis into an operational field briefing. Resulting briefing and risk context feed SafetyKit and the dashboard.
+                When a user selects a crisis or country, FastAPI triggers: (1) live Google News fetch for breaking news; (2) vector search in Actian for stored intel (GDACS, HDX, State Dept, HAPI); (3) LLM synthesis (OpenRouter) into an operational field briefing. Resulting briefing and risk context feed SafetyKit and the dashboard.
             </Step>
 
             <Step order="3" phase="Synthesis" source="modules/synthesis.py (Sphinx)" trigger="State Combination">
@@ -47,7 +47,7 @@
 
         <Track sponsor="Actian" challenge="VectorAI">
             <Component>Safety RAG: Contextual Risk Analysis (VectorAI)</Component>
-            <Integration>Layer 3 Context Engine: ingests GDACS, HDX, US State Dept, HDX HAPI, and Google News; chunks and embeds via Gemini; stores in Actian; retrieves and synthesizes operational field briefings via Gemini. Briefings target humanitarian workers deploying in-country (what changed this week, operating environment, key risks, operational recommendations).</Integration>
+            <Integration>Layer 3 Context Engine: ingests GDACS, HDX, US State Dept, HDX HAPI, and Google News; chunks and embeds via OpenRouter; stores in Actian; retrieves and synthesizes operational field briefings via OpenRouter. Briefings target humanitarian workers deploying in-country (what changed this week, operating environment, key risks, operational recommendations).</Integration>
         </Track>
 
         <Track sponsor="Sphinx" challenge="Unique Application">
@@ -68,7 +68,7 @@
                 <Source name="HDX HAPI">Structured data: conflict events (ACLED), food security (IPC); app_identifier required, no API key.</Source>
                 <Source name="Google News RSS">Breaking news (last 7 days); always fetched live at report time; no auth.</Source>
             </DataSources>
-            <Output>Operational field briefing for humanitarian workers: What Changed This Week, Operating Environment, Key Risks, Operational Recommendations. Synthesized via Gemini from retrieved chunks and live news. ReliefWeb not used (requires pre-approved app name).</Output>
+            <Output>Operational field briefing for humanitarian workers: What Changed This Week, Operating Environment, Key Risks, Operational Recommendations. Synthesized via OpenRouter from retrieved chunks and live news. ReliefWeb not used (requires pre-approved app name).</Output>
         </Layer3>
 
         <Track category="Backend Framework">
@@ -91,7 +91,7 @@
                 <File name="pipeline.py">P1: ACAPS/FTS Data Engineering</File>
                 <File name="vision.py">P2: Satellite CV logic</File>
                 <File name="vector.py">P2: Delegates safety report to context_engine</File>
-                <File name="context_engine.py">Layer 3: Data ingest (GDACS, HDX CKAN/HAPI, US State Dept, Google News), chunking, Gemini embeddings, Actian store, RAG + Gemini synthesis for operational briefings</File>
+                <File name="context_engine.py">Layer 3: Data ingest (GDACS, HDX CKAN/HAPI, US State Dept, Google News), chunking, OpenRouter embeddings, Actian store, RAG + OpenRouter synthesis for operational briefings</File>
                 <File name="synthesis.py">P3: Sphinx Prompting</File>
             </Folder>
             <Folder name="static">
