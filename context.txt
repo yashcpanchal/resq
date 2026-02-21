@@ -6,31 +6,68 @@
     </Metadata>
 
     <Architecture>
-        <DesignPattern>Modular Service Pattern</DesignPattern>
-        <Philosophy>Isolation of concerns. Each module (pipeline, vision, vector, synthesis) should be functional and testable independently.</Philosophy>
-        <Orchestration>app.py (Streamlit) acts as the central hub, importing logic from the modules/ directory.</Orchestration>
+        <DesignPattern>Decoupled Micro-Module Architecture</DesignPattern>
+        <Philosophy>
+            Isolation of concerns via a 'Clean Architecture' approach. The system is split into three distinct layers: Data Engineering (Databricks), API Orchestration (FastAPI), and Reactive UI (Next.js). Each module within these layers must be functional, independently testable, and strictly typed.
+        </Philosophy>
+        
+        <Orchestration>
+            <Backend>FastAPI serves as the 'Intelligence Gateway,' managing asynchronous calls to Actian and Sphinx while serving pre-processed Databricks analytics.</Backend>
+            <Frontend>Next.js (App Router) acts as the 'Operational Dashboard,' handling client-state, map rendering, and real-time safety flagging via SafetyKit.</Frontend>
+        </Orchestration>
+
         <DataFlow>
-            <Step order="1" source="Databricks (pipeline.py)" destination="data/neglect_scores.json">Ingest and calculate neglect scores.</Step>
-            <Step order="2" source="modules/vision.py &amp; modules/vector.py" trigger="Coordinate Consumption">Validate logistical and safety context.</Step>
-            <Step order="3" source="synthesis.py (Sphinx)" trigger="Combination">Generate deployment plan memo.</Step>
+            <Step order="1" phase="Ingestion" source="Databricks (pipeline.py)" destination="FastAPI /data store">
+                Fetch ACAPS Severity and UN OCHA Funding. Perform math to produce the Neglect Index. Output is cached for API consumption.
+            </Step>
+            
+            <Step order="2" phase="Validation" source="modules/vector.py (Actian)" trigger="On-Demand API Call">
+                When a user selects a crisis in Next.js, FastAPI triggers a vector search in Actian to retrieve unstructured safety reports. Resulting 'Risk Score' is fed to SafetyKit.
+            </Step>
+
+            <Step order="3" phase="Synthesis" source="modules/synthesis.py (Sphinx)" trigger="State Combination">
+                Combine Neglect Score (Quantitative) and Safety Context (Qualitative). Sphinx generates a strategic deployment memo. 
+            </Step>
+
+            <Step order="4" phase="Presentation" source="FastAPI" destination="Next.js Frontend">
+                Serve the finalized 'Investment Package' including the map coordinates, safety status, and the Sphinx-generated memo via a RESTful JSON response.
+            </Step>
         </DataFlow>
+
+        <CommunicationContract>
+            RESTful API over HTTP. Next.js communicates with FastAPI using strictly defined Pydantic schemas shared across the backend to ensure frontend type-safety (via TypeScript interfaces).
+        </CommunicationContract>
     </Architecture>
 
     <TechStack>
         <Track sponsor="Databricks" challenge="Geo-Insight">
-            <Component>Core Engine (PySpark/Python)</Component>
+            <Component>Core Engine: Data Ingestion (ACAPS/FTS) and Mismatch Math (PySpark/Python)</Component>
+            <Integration>Exports prioritized crisis data to FastAPI backend via JSON/Data Lake</Integration>
         </Track>
-        <Track sponsor="GrowthFactor" challenge="Parking Detection">
-            <Component>Logistics (CV/Satellite)</Component>
-        </Track>
+
         <Track sponsor="Actian" challenge="VectorAI">
-            <Component>Safety RAG (VectorAI)</Component>
+            <Component>Safety RAG: Contextual Risk Analysis (VectorAI)</Component>
+            <Integration>Processes unstructured PDF/News data to provide 'Safety Context' to the backend</Integration>
         </Track>
+
         <Track sponsor="Sphinx" challenge="Unique Application">
-            <Component>Intelligence (LLM)</Component>
+            <Component>Intelligence: LLM-powered Strategic Memo Generation</Component>
+            <Integration>Synthesizes Databricks math and Actian text into actionable deployment plans</Integration>
         </Track>
+
         <Track sponsor="SafetyKit" challenge="Human Safety">
-            <Component>Safety Layer</Component>
+            <Component>Safety Layer: Automated Risk Filtering and Guardrails</Component>
+            <Integration>Enforces 'No-Deploy' zones in the UI based on Actian security risk scores</Integration>
+        </Track>
+
+        <Track category="Backend Framework">
+            <Component>FastAPI (Python 3.13)</Component>
+            <Role>The Orchestrator: Manages API routing, data schemas (Pydantic), and serves as the bridge between AI modules and the UI</Role>
+        </Track>
+
+        <Track category="Frontend Framework">
+            <Component>Next.js (React / TypeScript / Tailwind CSS)</Component>
+            <Role>The Dashboard: Visualizes the 'Neglect Map' using Mapbox/Leaflet and provides the interface for 'Investment Memos'</Role>
         </Track>
     </TechStack>
 
@@ -85,9 +122,29 @@
     </TeamRoles>
 
     <StrategicGuardrails>
-        <Guardrail id="1">Zero-Inference: Do not assume safety on missing data.</Guardrail>
-        <Guardrail id="2">Modular Imports: app.py must only import from modules/.</Guardrail>
-        <Guardrail id="3">Mocking: Use mock functions for frontend stability if APIs are unstable.</Guardrail>
-        <Guardrail id="4">SafetyKit Integration: Flag 'Logistics Red Alert' if neglect is high but parking is zero.</Guardrail>
+        <Guardrail id="1" name="Zero-Inference Policy">
+            <Statement>Do not assume safety or feasibility on missing data.</Statement>
+            <Logic>If Actian VectorAI returns "No data found" for a high-severity region, the system must default to a 'Caution' state rather than 'Safe'. This prevents the AI from hallucinating safety in a data vacuum.</Logic>
+        </Guardrail>
+
+        <Guardrail id="2" name="Modular Dependency Isolation">
+            <Statement>The API entry point (app.py) must remain logic-agnostic.</Statement>
+            <Logic>All heavy lifting (math, RAG, prompt engineering) stays inside the /modules/ directory. app.py only handles HTTP orchestration. This ensures Person 3 can refactor the API without breaking Person 1's Databricks logic.</Logic>
+        </Guardrail>
+
+        <Guardrail id="3" name="Stability via State Mocking">
+            <Statement>Maintain 'Demo-Ready' state through API fallbacks.</Statement>
+            <Logic>Wrap every external API call (Sphinx, Actian) in a try-except block that returns a local 'Mock JSON' if the service is down or rate-limited. The frontend must never show a 500 error during the pitch.</Logic>
+        </Guardrail>
+
+        <Guardrail id="4" name="Conflict-Aware Filtering">
+            <Statement>Trigger SafetyKit 'Hard-Stop' on high-risk vectors.</Statement>
+            <Logic>If Actian identifies active combat or infrastructure collapse, the SafetyKit layer must programmatically disable the 'Allocate Funds' button in Next.js, regardless of how high the Databricks Neglect Score is. Safety over Arbitrage.</Logic>
+        </Guardrail>
+
+        <Guardrail id="5" name="Schema-First Development">
+            <Statement>No logic changes without a Pydantic Schema update.</Statement>
+            <Logic>If Person 1 changes the Databricks output format, they must update api/schemas.py first. This allows Cursor to immediately flag broken code in the Next.js frontend or the Synthesis module.</Logic>
+        </Guardrail>
     </StrategicGuardrails>
 </Project>
