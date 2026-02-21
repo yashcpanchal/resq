@@ -3,10 +3,15 @@ Layer 3 — Context Engine (Safety Intelligence via RAG)
 
 Pipeline: GDACS + HDX → chunk → embed (OpenAI) → store (Actian VectorAI) → search.
 Gracefully degrades when Actian or OpenAI credentials are missing.
+
+CLI usage:
+    python -m modules.context_engine          # full pipeline test
+    python -m modules.context_engine Sudan    # target a specific country
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import re
@@ -30,8 +35,8 @@ EMBEDDING_DIM = 1536
 CHUNK_MAX_TOKENS = 500
 CHUNK_OVERLAP_TOKENS = 50
 
-# Actian table name for our vector store
-TABLE_NAME = "resq_safety_chunks"
+# Actian VectorAI table — matches the hackathon sponsor requirement
+TABLE_NAME = "safety_intelligence"
 
 # ---------------------------------------------------------------------------
 # Country lookup (simple lat/lng → country for the hackathon)
@@ -66,6 +71,10 @@ def _coords_to_country(lat: float, lng: float) -> str:
     return best
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+#  SECTION 1 — DATA INGESTION (GDACS + HDX)
+# ═══════════════════════════════════════════════════════════════════════════
+
 # ---------------------------------------------------------------------------
 # 1a. GDACS RSS Feed — Live Disaster Alerts
 # ---------------------------------------------------------------------------
@@ -86,7 +95,8 @@ _EVENT_TYPE_LABELS = {
 async def fetch_gdacs_alerts(country: str) -> list[dict[str, Any]]:
     """Fetch current disaster alerts from GDACS RSS filtered by *country*.
 
-    Returns list of dicts: ``{title, body, source, date, country, alert_level, event_type}``.
+    Returns list of dicts with keys: title, body, source, date, country,
+    alert_level, event_type.
     """
     try:
         async with httpx.AsyncClient(timeout=20) as client:
@@ -151,7 +161,7 @@ async def fetch_gdacs_alerts(country: str) -> list[dict[str, Any]]:
 async def fetch_hdx_reports(country: str, limit: int = 5) -> list[dict[str, Any]]:
     """Search HDX for recent humanitarian reports about *country*.
 
-    Returns list of dicts: ``{title, body, source, date, country}``.
+    Returns list of dicts with keys: title, body, source, date, country.
     """
     queries = [
         f"situation report {country}",
@@ -210,9 +220,9 @@ async def fetch_hdx_reports(country: str, limit: int = 5) -> list[dict[str, Any]
     return all_reports
 
 
-# ---------------------------------------------------------------------------
-# 2. Text Chunking
-# ---------------------------------------------------------------------------
+# ═══════════════════════════════════════════════════════════════════════════
+#  SECTION 2 — TEXT CHUNKING
+# ═══════════════════════════════════════════════════════════════════════════
 
 _enc: tiktoken.Encoding | None = None
 
@@ -242,12 +252,12 @@ def chunk_text(
     return chunks
 
 
-# ---------------------------------------------------------------------------
-# 3. OpenAI Embeddings
-# ---------------------------------------------------------------------------
+# ═══════════════════════════════════════════════════════════════════════════
+#  SECTION 3 — OPENAI EMBEDDINGS
+# ═══════════════════════════════════════════════════════════════════════════
 
 async def embed_text(text: str) -> list[float]:
-    """Return the embedding vector for *text* using OpenAI."""
+    """Return the embedding vector for *text* using OpenAI text-embedding-3-small."""
     from openai import AsyncOpenAI
 
     api_key = os.getenv("OPENAI_API_KEY")
@@ -261,7 +271,7 @@ async def embed_text(text: str) -> list[float]:
 
 
 async def embed_texts(texts: list[str]) -> list[list[float]]:
-    """Batch embed multiple texts."""
+    """Batch embed multiple texts using OpenAI text-embedding-3-small."""
     from openai import AsyncOpenAI
 
     api_key = os.getenv("OPENAI_API_KEY")
@@ -274,116 +284,221 @@ async def embed_texts(texts: list[str]) -> list[list[float]]:
     return [d.embedding for d in resp.data]
 
 
-# ---------------------------------------------------------------------------
-# 4. Actian VectorAI (pyodbc)
-# ---------------------------------------------------------------------------
+# ═══════════════════════════════════════════════════════════════════════════
+#  SECTION 4 — ACTIAN VectorAI (pyodbc)
+# ═══════════════════════════════════════════════════════════════════════════
 
 def _get_actian_connection():
-    """Return a pyodbc connection to Actian VectorAI, or None."""
+    """Return a pyodbc connection to Actian VectorAI, or None.
+
+    Supports two connection modes:
+      - DSN-based:    set ACTIAN_DSN
+      - Direct:       set ACTIAN_HOST (defaults to localhost)
+
+    Docker: docker pull williamimoh/actian-vectorai-db:1.0b
+    """
+    try:
+        import pyodbc
+    except ImportError:
+        logger.warning("pyodbc not installed — Actian VectorAI unavailable")
+        return None
+
     dsn = os.getenv("ACTIAN_DSN")
-    if not dsn:
-        logger.warning("ACTIAN_DSN not set — Actian VectorAI unavailable")
+    host = os.getenv("ACTIAN_HOST", "")
+    user = os.getenv("ACTIAN_USER", "")
+    password = os.getenv("ACTIAN_PASSWORD", "")
+    database = os.getenv("ACTIAN_DATABASE", "iidbdb")
+    port = os.getenv("ACTIAN_PORT", "VW")
+
+    if not dsn and not host:
+        logger.warning(
+            "Neither ACTIAN_DSN nor ACTIAN_HOST is set — "
+            "Actian VectorAI unavailable"
+        )
         return None
 
     try:
-        import pyodbc
-        user = os.getenv("ACTIAN_USER", "")
-        password = os.getenv("ACTIAN_PASSWORD", "")
-        conn = pyodbc.connect(
-            f"DSN={dsn};UID={user};PWD={password}", autocommit=True,
-        )
+        if dsn:
+            conn_str = f"DSN={dsn};UID={user};PWD={password}"
+        else:
+            conn_str = (
+                f"driver=Ingres;servertype=ingres;"
+                f"server=@{host},tcp_ip,{port};"
+                f"uid={user};pwd={password};database={database}"
+            )
+        conn = pyodbc.connect(conn_str, autocommit=True)
+        logger.info("Connected to Actian VectorAI")
         return conn
     except Exception as exc:
         logger.error("Failed to connect to Actian VectorAI: %s", exc)
         return None
 
 
-def init_table(conn) -> None:
-    """Create the vector store table if it does not already exist."""
+# ---------------------------------------------------------------------------
+# 4a. init_db() — Create the safety_intelligence table
+# ---------------------------------------------------------------------------
+
+def init_db(conn=None) -> bool:
+    """Create the ``safety_intelligence`` table if it doesn't exist.
+
+    Schema:
+        id        INT  (auto-increment)
+        country   VARCHAR(200)
+        content   VARCHAR(8000)
+        embedding VECTOR(1536)
+
+    Returns True on success, False if the connection is unavailable.
+    """
+    close_after = False
+    if conn is None:
+        conn = _get_actian_connection()
+        close_after = True
+    if conn is None:
+        return False
+
     ddl = textwrap.dedent(f"""\
         CREATE TABLE IF NOT EXISTS {TABLE_NAME} (
-            id          INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-            country     VARCHAR(120)  NOT NULL,
-            title       VARCHAR(500),
-            chunk_text  VARCHAR(8000) NOT NULL,
-            source      VARCHAR(300),
-            report_date VARCHAR(60),
-            embedding   VECTOR({EMBEDDING_DIM}) NOT NULL
+            id        INT          NOT NULL GENERATED ALWAYS AS IDENTITY,
+            country   VARCHAR(200) NOT NULL,
+            content   VARCHAR(8000) NOT NULL,
+            embedding VECTOR({EMBEDDING_DIM}) NOT NULL
         )
     """)
-    cursor = conn.cursor()
-    cursor.execute(ddl)
-    cursor.close()
+    try:
+        cursor = conn.cursor()
+        cursor.execute(ddl)
+        cursor.close()
+        logger.info("Table '%s' is ready", TABLE_NAME)
+        return True
+    except Exception as exc:
+        logger.error("init_db failed: %s", exc)
+        return False
+    finally:
+        if close_after:
+            conn.close()
 
 
-def store_chunks(conn, chunks: list[dict[str, Any]]) -> int:
-    """Insert pre-embedded chunks into Actian VectorAI.
+# ---------------------------------------------------------------------------
+# 4b. ingest_intelligence() — Embed + Store
+# ---------------------------------------------------------------------------
 
-    Returns the number of rows inserted.
+async def ingest_intelligence(
+    country: str,
+    text_list: list[str],
+    conn=None,
+) -> int:
+    """Generate embeddings for each text and insert into Actian VectorAI.
+
+    Args:
+        country:   Country name (e.g. "Sudan").
+        text_list: List of text strings to embed and store.
+        conn:      Optional existing pyodbc connection.
+
+    Returns the number of rows inserted, or 0 if the DB is unavailable.
     """
-    sql = textwrap.dedent(f"""\
-        INSERT INTO {TABLE_NAME}
-            (country, title, chunk_text, source, report_date, embedding)
-        VALUES
-            (?, ?, ?, ?, ?, TO_VECTOR(?))
-    """)
-    cursor = conn.cursor()
-    count = 0
-    for c in chunks:
-        emb_str = ",".join(str(v) for v in c["embedding"])
-        cursor.execute(sql, (
-            c["country"],
-            c["title"][:500],
-            c["chunk_text"][:8000],
-            c["source"][:300],
-            c["report_date"],
-            emb_str,
-        ))
-        count += 1
-    cursor.close()
-    return count
+    if not text_list:
+        return 0
 
+    close_after = False
+    if conn is None:
+        conn = _get_actian_connection()
+        close_after = True
+    if conn is None:
+        logger.warning("Actian unavailable — cannot ingest %d texts", len(text_list))
+        return 0
 
-def search_similar(
-    conn,
-    query_embedding: list[float],
-    country: str | None = None,
-    top_k: int = 5,
-) -> list[dict[str, Any]]:
-    """Find the *top_k* most similar chunks to *query_embedding*."""
-    emb_str = ",".join(str(v) for v in query_embedding)
-    where = "WHERE country = ?" if country else ""
-    sql = textwrap.dedent(f"""\
-        SELECT title, chunk_text, source, report_date, country
-        FROM   {TABLE_NAME}
-        {where}
-        ORDER BY VECTOR_DISTANCE(embedding, TO_VECTOR(?))
-        FETCH FIRST ? ROWS ONLY
-    """)
+    try:
+        init_db(conn)
 
-    cursor = conn.cursor()
-    if country:
-        cursor.execute(sql, (country, emb_str, top_k))
-    else:
-        cursor.execute(sql, (emb_str, top_k))
+        # Generate embeddings
+        embeddings = await embed_texts(text_list)
 
-    rows = cursor.fetchall()
-    columns = ["title", "chunk_text", "source", "report_date", "country"]
-    results = [dict(zip(columns, row)) for row in rows]
-    cursor.close()
-    return results
+        # Critical Actian SQL syntax — TO_VECTOR(?)
+        sql = (
+            f"INSERT INTO {TABLE_NAME} (country, content, embedding) "
+            f"VALUES (?, ?, TO_VECTOR(?))"
+        )
+
+        cursor = conn.cursor()
+        count = 0
+        for text, emb in zip(text_list, embeddings):
+            emb_str = ",".join(str(v) for v in emb)
+            cursor.execute(sql, (country, text[:8000], emb_str))
+            count += 1
+        cursor.close()
+
+        logger.info("Ingested %d rows for %s into '%s'", count, country, TABLE_NAME)
+        return count
+
+    except Exception as exc:
+        logger.error("ingest_intelligence failed: %s", exc)
+        return 0
+    finally:
+        if close_after:
+            conn.close()
 
 
 # ---------------------------------------------------------------------------
-# 5. High-level Orchestrators
+# 4c. get_safety_brief() — Hybrid Search (filter + vector distance)
 # ---------------------------------------------------------------------------
+
+async def get_safety_brief(
+    country: str,
+    query: str,
+    top_k: int = 3,
+    conn=None,
+) -> list[str]:
+    """Embed the *query* and retrieve the top-k most relevant chunks.
+
+    Uses Actian's hybrid search: filter by country, sort by VECTOR_DISTANCE.
+
+    Returns a list of content strings, or an empty list if unavailable.
+    """
+    close_after = False
+    if conn is None:
+        conn = _get_actian_connection()
+        close_after = True
+    if conn is None:
+        return []
+
+    try:
+        query_emb = await embed_text(query)
+        emb_str = ",".join(str(v) for v in query_emb)
+
+        # Critical Actian SQL syntax — VECTOR_DISTANCE + TO_VECTOR
+        sql = (
+            f"SELECT content FROM {TABLE_NAME} "
+            f"WHERE country = ? "
+            f"ORDER BY VECTOR_DISTANCE(embedding, TO_VECTOR(?)) ASC "
+            f"LIMIT 3"
+        )
+
+        cursor = conn.cursor()
+        cursor.execute(sql, (country, emb_str))
+        rows = cursor.fetchall()
+        cursor.close()
+
+        results = [row[0] for row in rows]
+        logger.info("get_safety_brief: %d results for '%s' in %s", len(results), query[:50], country)
+        return results
+
+    except Exception as exc:
+        logger.error("get_safety_brief failed: %s", exc)
+        return []
+    finally:
+        if close_after:
+            conn.close()
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  SECTION 5 — HIGH-LEVEL ORCHESTRATORS (API Integration)
+# ═══════════════════════════════════════════════════════════════════════════
 
 async def ingest_country(country: str, limit: int = 10) -> int:
-    """End-to-end: fetch GDACS + HDX → chunk → embed → store in Actian.
+    """End-to-end: fetch GDACS + HDX → chunk → ingest into Actian.
 
-    Returns the total number of chunks stored.
+    Returns the total number of rows stored.
     """
-    # Fetch from both sources concurrently
     gdacs_alerts = await fetch_gdacs_alerts(country)
     hdx_reports = await fetch_hdx_reports(country, limit=limit)
 
@@ -393,80 +508,43 @@ async def ingest_country(country: str, limit: int = 10) -> int:
         return 0
 
     logger.info(
-        "Ingesting %d sources for %s (%d GDACS alerts, %d HDX reports)",
+        "Ingesting %d sources for %s (%d GDACS, %d HDX)",
         len(combined), country, len(gdacs_alerts), len(hdx_reports),
     )
 
-    # Chunk all reports
-    all_chunks: list[dict[str, Any]] = []
+    # Chunk all report bodies into smaller pieces
+    text_list: list[str] = []
     for rpt in combined:
-        text_chunks = chunk_text(rpt["body"])
-        for tc in text_chunks:
-            all_chunks.append({
-                "country": rpt["country"],
-                "title": rpt["title"],
-                "chunk_text": tc,
-                "source": rpt["source"],
-                "report_date": rpt["date"],
-            })
+        chunks = chunk_text(rpt["body"])
+        text_list.extend(chunks)
 
-    if not all_chunks:
+    if not text_list:
         return 0
 
-    # Batch embed
-    texts = [c["chunk_text"] for c in all_chunks]
-    embeddings = await embed_texts(texts)
-    for c, emb in zip(all_chunks, embeddings):
-        c["embedding"] = emb
-
-    # Store in Actian
-    conn = _get_actian_connection()
-    if conn is None:
-        logger.warning(
-            "Actian unavailable — skipping storage for %s (%d chunks prepared)",
-            country, len(all_chunks),
-        )
-        return 0
-
-    try:
-        init_table(conn)
-        stored = store_chunks(conn, all_chunks)
-        logger.info("Stored %d chunks for %s in Actian VectorAI", stored, country)
-        return stored
-    finally:
-        conn.close()
+    # Ingest into Actian VectorAI
+    stored = await ingest_intelligence(country, text_list)
+    return stored
 
 
 async def get_safety_report(lat: float, lng: float) -> str:
     """Return a safety/security briefing for the location at (*lat*, *lng*).
 
-    Performs RAG search against Actian VectorAI. Falls back to a
-    live-fetched briefing when the database is unavailable.
+    Tries Actian RAG first; falls back to live-fetched data.
     """
     country = _coords_to_country(lat, lng)
 
-    # Try Actian RAG first
-    conn = _get_actian_connection()
-    if conn is not None:
-        try:
-            query = f"What are the current security risks and safety conditions in {country}?"
-            query_emb = await embed_text(query)
-            results = search_similar(conn, query_emb, country=country, top_k=5)
-        finally:
-            conn.close()
-
-        if results:
-            sections: list[str] = []
-            for i, r in enumerate(results, 1):
-                sections.append(
-                    f"[{i}] {r['title']} (Source: {r['source']}, "
-                    f"Date: {r['report_date']})\n{r['chunk_text'][:1500]}"
-                )
-            return (
-                f"## Safety & Security Briefing — {country}\n"
-                f"Coordinates: ({lat}, {lng})\n\n"
-                + "\n\n---\n\n".join(sections)
-            )
+    # Try Actian RAG search first
+    results = await get_safety_brief(
+        country, f"What are the security risks and safety conditions in {country}?"
+    )
+    if results:
+        sections = [f"[{i}] {text[:1500]}" for i, text in enumerate(results, 1)]
+        return (
+            f"## Safety & Security Briefing — {country}\n"
+            f"Coordinates: ({lat}, {lng})\n"
+            f"Source: Actian VectorAI RAG\n\n"
+            + "\n\n---\n\n".join(sections)
+        )
 
     # Fallback: fetch live data directly and return as briefing
     logger.info("Actian unavailable — building live briefing for %s", country)
@@ -500,3 +578,74 @@ async def get_safety_report(lat: float, lng: float) -> str:
         f"*Live data — Actian VectorAI not configured*\n\n"
     )
     return header + "\n".join(parts)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  __main__ — Full Pipeline Test
+# ═══════════════════════════════════════════════════════════════════════════
+
+async def _run_pipeline(country: str) -> None:
+    """Execute the complete Layer 3 pipeline for demonstration."""
+    print(f"\n{'='*60}")
+    print(f"  ResQ-Capital — Layer 3 Context Engine")
+    print(f"  Target Country: {country}")
+    print(f"{'='*60}\n")
+
+    # Step 1: Fetch data from GDACS + HDX
+    print("[Step 1] Fetching intelligence from GDACS + HDX...")
+    gdacs_alerts = await fetch_gdacs_alerts(country)
+    hdx_reports = await fetch_hdx_reports(country, limit=5)
+    print(f"  → GDACS: {len(gdacs_alerts)} alerts")
+    print(f"  → HDX:   {len(hdx_reports)} reports")
+
+    combined = gdacs_alerts + hdx_reports
+    if not combined:
+        print(f"\n  ⚠ No data found for {country}. Try a different country.")
+        return
+
+    # Chunk the text
+    text_list: list[str] = []
+    for rpt in combined:
+        chunks = chunk_text(rpt["body"])
+        text_list.extend(chunks)
+    print(f"  → Chunks: {len(text_list)} text chunks prepared")
+
+    # Step 2: Ingest into Actian VectorAI
+    print("\n[Step 2] Ingesting into Actian VectorAI...")
+    stored = await ingest_intelligence(country, text_list)
+    if stored > 0:
+        print(f"  → ✅ Stored {stored} rows in '{TABLE_NAME}'")
+    else:
+        print(f"  → ⚠ Actian unavailable — {len(text_list)} chunks ready but not stored")
+        print("    Set ACTIAN_DSN or ACTIAN_HOST env vars to enable storage")
+
+    # Step 3: Search
+    print(f"\n[Step 3] Running test search: 'What are the security risks?'")
+    results = await get_safety_brief(country, "What are the security risks?")
+    if results:
+        print(f"  → ✅ Retrieved {len(results)} relevant chunks:\n")
+        for i, text in enumerate(results, 1):
+            print(f"  --- Result {i} ---")
+            print(f"  {text[:300]}...")
+            print()
+    else:
+        print("  → ⚠ No Actian results (DB not connected)")
+        print("    Falling back to live data preview:\n")
+        for rpt in combined[:3]:
+            print(f"  [{rpt['source']}] {rpt['title']}")
+            print(f"  {rpt['body'][:200]}...\n")
+
+    print(f"\n{'='*60}")
+    print(f"  Pipeline complete for {country}")
+    print(f"{'='*60}\n")
+
+
+if __name__ == "__main__":
+    import sys
+    from dotenv import load_dotenv
+
+    load_dotenv()
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+
+    target_country = sys.argv[1] if len(sys.argv) > 1 else "Afghanistan"
+    asyncio.run(_run_pipeline(target_country))
