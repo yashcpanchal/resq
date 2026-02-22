@@ -12,6 +12,7 @@ interface SidePanelProps {
     country: string | null;
     score: number;
     scoreDomain?: [number, number];
+    scoreMode?: "funding" | "crisis";
     lat?: number;
     lng?: number;
     onClose: () => void;
@@ -79,7 +80,7 @@ function FormattedBriefing({ text }: { text: string }) {
     );
 }
 
-export default function SidePanel({ country, score, scoreDomain = [0, 1], lat, lng, onClose }: SidePanelProps) {
+export default function SidePanel({ country, score, scoreDomain = [0, 1], scoreMode = "funding", lat, lng, onClose }: SidePanelProps) {
     const badge = scoreBadge(score);
     const hasCoords = lat !== undefined && lng !== undefined;
 
@@ -174,14 +175,14 @@ export default function SidePanel({ country, score, scoreDomain = [0, 1], lat, l
                                 {/* Funding Score Gauge */}
                                 <div>
                                     <p className="text-xs text-gray-400 uppercase tracking-wider mb-2">
-                                        Funding Score
+                                        {scoreMode === "funding" ? "Funding Score" : "Crisis Score"}
                                     </p>
                                     <div className="relative h-3 rounded-full bg-gray-800 overflow-hidden">
                                         <motion.div
                                             initial={{ width: 0 }}
                                             animate={{
                                                 width: !isNaN(score)
-                                                    ? `${Math.min(Math.abs(score) / 100, 100)}%`
+                                                    ? `${Math.min(100, Math.max(0, ((score - scoreDomain[0]) / (scoreDomain[1] - scoreDomain[0])) * 100))}%`
                                                     : "0%",
                                             }}
                                             transition={{ duration: 0.8, ease: "easeOut" }}

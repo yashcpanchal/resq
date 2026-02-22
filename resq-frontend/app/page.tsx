@@ -232,6 +232,7 @@ export default function Home() {
         country={selected?.name ?? null}
         score={selected?.score ?? -1}
         scoreDomain={scoreDomain}
+        scoreMode={scoreMode}
         lat={selectedRegion?.lat}
         lng={selectedRegion?.lng}
         onClose={handleCloseLeftPanel}
