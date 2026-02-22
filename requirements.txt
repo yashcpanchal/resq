@@ -12,3 +12,5 @@ osmnx
 hdx-python-api>=6.6.0
 
 # Crisis query uses OpenRouter LLM (OPENROUTER_API_KEY in .env); no extra package
+Pillow
+requests

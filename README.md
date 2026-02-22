@@ -14,6 +14,14 @@ The backend provides **operational field briefings** for humanitarian workers de
 
 Briefings are synthesized by **OpenRouter LLM** (default: Arcee AI Trinity Large Preview) into: *What Changed This Week* → *Operating Environment* → *Key Risks* → *Local Situation* → *Operational Recommendations*. Aimed at aid workers who are deploying regardless; focus is on how to operate safely, not whether to go.
 
+## Layer 2 — Candidate Verification (Vision/Logistics)
+
+The pipeline identifies viable aid drop-zones/staging areas using local machine vision:
+1. **OSM Scouting** (`osm_finder.py`) — Queries OpenStreetMap for nearby schools, hospitals, open land, etc.
+2. **Satellite Intelligence** (`ground_verifier.py`) — Fetches high-resolution satellite imagery (Esri) for each coordinate.
+3. **VLM Validation** (`candidate_verification.py` / `Ollama`) — Feeds images into a local Vision-Language Model (`llava`) to assess ground operability (e.g., road access, rubble blockages).
+4. **Visual Annotation** (`image_annotator.py`) — Draws bounding boxes and labels VLM insights on the raw image using Pillow.
+
 ## Getting Started
 
 ### 1. Python environment
@@ -26,7 +34,7 @@ pip install -r requirements.txt
 pip install actian-beta/actiancortex-0.1.0b1-py3-none-any.whl
 ```
 
-### 2. Actian VectorAI (optional but recommended for RAG)
+### 2. Actian VectorAI and Ollama (Local AI)
 
 For full RAG (ingest + search), run Actian in Docker:
 
@@ -36,6 +44,12 @@ docker compose up -d
 ```
 
 Default: `localhost:50051`. Override with `ACTIAN_SERVER` if needed. If Actian is not running, the API still works using live-fetched data only.
+
+For Layer 2 image verification, ensure **[Ollama](https://ollama.com/)** is running locally with the `llava` model:
+```bash
+ollama run llava
+```
+
 
 ### 3. Environment variables
 
@@ -88,8 +102,14 @@ resq/
 │   ├── routes.py       # API route handlers
 │   └── schemas.py      # Pydantic request/response models
 ├── modules/
-│   ├── context_engine.py  # Layer 3: data fetch, chunk, embed, Actian, OpenRouter synthesis
+│   ├── candidate_verification.py # Layer 2: OSM finder + Ollama VLM verification
+│   ├── context_engine.py  # Layer 3: data fetch, chunk, embed, Actian, synthesis
 │   ├── country_codes.py   # ISO3 / State Dept code maps for all countries
+│   ├── crisis_query.py    # Layer 3: City-level LLM queries (OpenRouter)
+│   ├── ground_verifier.py # Layer 2: Ollama vision logic and Esri tiles
+│   ├── image_annotator.py # Layer 2: Pillow bounding box drawing
+│   ├── osm_finder.py      # Layer 2: OSM staging area finder (OSMnx/Nominatim)
+│   ├── osm_features.py    # Layer 2: Extends OSM mapping logic
 │   ├── pipeline.py    # Neglect scores (stub)
 │   ├── vision.py      # Parking capacity (stub)
 │   ├── vector.py      # Delegates to context_engine for safety report
@@ -105,9 +125,10 @@ resq/
 ## Dependencies
 
 - **FastAPI / Uvicorn** — API server
-- **httpx** — Async HTTP (GDACS, HDX, State Dept, Google News, OpenRouter)
+- **httpx** / **requests** — Async/Sync HTTP (GDACS, HDX, State Dept, Google News, OpenRouter, Esri, Ollama)
 - **tiktoken** — Chunking for embeddings
 - **python-dotenv** — Load `.env`
+- **Pillow** — Image annotation for UI payloads
 - **Actian Cortex** — Install from `actian-beta/actiancortex-*.whl` when using the vector DB
 
 See `requirements.txt`. ReliefWeb is not used (requires pre-approved app name).
