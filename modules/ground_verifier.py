@@ -44,13 +44,34 @@ SATELLITE_PROMPT = (
 
 # Humanitarian aid analysis prompt (used by Ollama — plain text output)
 AID_ANALYSIS_PROMPT = (
-    "This is a satellite image of '{site_name}' ({category}). "
-    "Describe what you see and explain the best way to provide "
-    "humanitarian aid to this area. Consider: terrain and structures, "
-    "how to deliver supplies, where to set up a staging area, "
-    "and any visible risks or obstacles. Be concise."
+    "You are analyzing a satellite image of '{site_name}' ({category}). "
+    "Only use information that is directly visible in the image. "
+    "Do NOT give general humanitarian advice. Do NOT mention coordination, policy, or training.\n\n"
+
+    "Step 1 — Describe Visible Features:\n"
+    "- Describe terrain (flat, sloped, flooded, rubble, vegetation).\n"
+    "- Identify roads or paths and where they enter/exit the area.\n"
+    "- Identify open flat spaces large enough for trucks or helicopters.\n"
+    "- Identify damaged or intact buildings.\n"
+    "- Identify obstacles (debris, water, blocked roads).\n\n"
+
+    "Step 2 — Plan Aid Delivery Using Only What You See:\n"
+    "- Choose a specific entry point (north, south, east, west, or visible road).\n"
+    "- Choose a specific staging area visible in the image and explain why it works.\n"
+    "- Explain how trucks or helicopters would access that staging area.\n"
+    "- Mention any visible risks and how to avoid them.\n\n"
+
+    "Be concrete and reference visible landmarks. "
+    "Do NOT give generic advice. Base every decision on visible features in the image."
 )
 
+# Short prompt for per-cell descriptions
+CELL_PROMPT = (
+    "Describe this satellite image crop in 3-8 words. "
+    "Do NOT start with 'The image shows' or 'This is'. "
+    "Just name what you see: terrain type, buildings, roads, damage, etc. "
+    "Example: 'Damaged buildings with scattered rubble'"
+)
 
 # ================================================================== #
 #  Satellite Imagery — Google Maps (paid)                            #
@@ -188,6 +209,117 @@ def _resize_for_vlm(image_bytes: bytes, max_dim: int = 384) -> bytes:
     buf = io.BytesIO()
     img.save(buf, format="JPEG", quality=80)
     return buf.getvalue()
+
+
+def _add_grid_labels(image_bytes: bytes) -> bytes:
+    """Draw bold, visible grid cell labels on the image (used for debug only now)."""
+    from PIL import Image, ImageDraw, ImageFont
+    img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    draw = ImageDraw.Draw(img)
+    w, h = img.size
+    font_size = max(16, w // 20)
+    try:
+        font = ImageFont.truetype("/System/Library/Fonts/Helvetica.ttc", font_size)
+    except (OSError, IOError):
+        try:
+            font = ImageFont.truetype(
+                "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", font_size)
+        except (OSError, IOError):
+            font = ImageFont.load_default()
+    for i in range(1, 3):
+        draw.line([(i * w // 3, 0), (i * w // 3, h)], fill=(255, 255, 255), width=2)
+        draw.line([(0, i * h // 3), (w, i * h // 3)], fill=(255, 255, 255), width=2)
+    labels = {
+        "NW": (0, 0), "N": (1, 0), "NE": (2, 0),
+        "W": (0, 1), "C": (1, 1), "E": (2, 1),
+        "SW": (0, 2), "S": (1, 2), "SE": (2, 2),
+    }
+    cw, ch = w // 3, h // 3
+    for label, (gx, gy) in labels.items():
+        cx, cy = gx * cw + cw // 2, gy * ch + ch // 2
+        bbox = font.getbbox(label)
+        tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+        draw.rectangle([cx - tw//2 - 4, cy - th//2 - 4, cx + tw//2 + 4, cy + th//2 + 4],
+                       fill=(0, 0, 0), outline=(255, 255, 255))
+        draw.text((cx, cy), label, fill=(255, 255, 255), font=font, anchor="mm")
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=85)
+    return buf.getvalue()
+
+
+def _crop_grid_cells(image_bytes: bytes) -> dict[str, bytes]:
+    """Crop a satellite image into 9 grid cells.
+
+    Returns a dict mapping grid tag ('NW', 'N', etc.) to JPEG bytes.
+    """
+    from PIL import Image
+
+    img = Image.open(io.BytesIO(image_bytes))
+    w, h = img.size
+    cw, ch = w // 3, h // 3
+
+    grid = {
+        "NW": (0, 0), "N": (1, 0), "NE": (2, 0),
+        "W": (0, 1),  "C": (1, 1), "E": (2, 1),
+        "SW": (0, 2), "S": (1, 2), "SE": (2, 2),
+    }
+
+    cells: dict[str, bytes] = {}
+    for tag, (gx, gy) in grid.items():
+        box = (gx * cw, gy * ch, (gx + 1) * cw, (gy + 1) * ch)
+        cell = img.crop(box)
+        buf = io.BytesIO()
+        cell.save(buf, format="JPEG", quality=80)
+        cells[tag] = buf.getvalue()
+
+    return cells
+
+
+def _describe_cell_sync(
+    cell_bytes: bytes,
+    tag: str,
+    model: str,
+    host: str,
+) -> tuple[str, str]:
+    """Send a single cropped cell to Ollama and get a short description.
+
+    Returns (tag, description).
+    """
+    b64 = base64.b64encode(cell_bytes).decode("utf-8")
+
+    payload = {
+        "model": model,
+        "prompt": CELL_PROMPT,
+        "images": [b64],
+        "stream": False,
+        "options": {
+            "temperature": 0.2,
+            "num_predict": 64,
+        },
+    }
+
+    try:
+        resp = requests.post(f"{host}/api/generate", json=payload, timeout=30)
+        resp.raise_for_status()
+        text = resp.json().get("response", "").strip()
+        # Clean up — take first sentence, strip preamble
+        text = text.split(".")[0].strip().rstrip(".")
+        # Remove common LLM preambles
+        for prefix in ["The image shows ", "This is ", "This shows ",
+                       "This image shows ", "The image is ", "I see "]:
+            if text.lower().startswith(prefix.lower()):
+                text = text[len(prefix):]
+                break
+        # Capitalize first letter
+        if text:
+            text = text[0].upper() + text[1:]
+        if not text:
+            text = "No distinct features visible"
+        return (tag, text)
+    except Exception as exc:
+        logger.warning("Cell %s description failed: %s", tag, exc)
+        return (tag, "Could not analyze this cell")
+
 
 
 # ================================================================== #
@@ -351,7 +483,7 @@ async def analyze_site_ollama(
     image_bytes: bytes,
     site_name: str,
     category: str,
-    model: str = "moondream",
+    model: str = "llava",
     ollama_host: str | None = None,
 ) -> dict[str, Any]:
     """Use a **local Ollama VLM** to analyze a site for humanitarian aid.
@@ -362,14 +494,14 @@ async def analyze_site_ollama(
 
     Prerequisites:
         1. Install Ollama: https://ollama.com
-        2. Pull a vision model:  ``ollama pull moondream``
+        2. Pull a vision model:  ``ollama pull llava``
         3. Ollama server must be running (it auto-starts on install)
 
     Args:
         image_bytes: Raw satellite image (JPEG/PNG).
         site_name: Human-readable name of the site.
         category: OSM category tag (e.g. ``"amenity=school"``).
-        model: Ollama model name (default ``"moondream"``).
+        model: Ollama model name (default ``"llava"``).
         ollama_host: Ollama API base URL (default ``http://localhost:11434``).
 
     Returns:
@@ -382,8 +514,8 @@ async def analyze_site_ollama(
     host = ollama_host or os.getenv("OLLAMA_HOST", "http://localhost:11434")
     url = f"{host}/api/generate"
 
-    # Resize image to 384px max dimension to speed up VLM processing
-    resized = _resize_for_vlm(image_bytes, max_dim=384)
+    # ── Pass 1: Full-image analysis (Steps 1-2) ─────────────────
+    resized = _resize_for_vlm(image_bytes, max_dim=512)
     b64_image = base64.b64encode(resized).decode("utf-8")
     prompt = AID_ANALYSIS_PROMPT.format(site_name=site_name, category=category)
 
@@ -394,7 +526,7 @@ async def analyze_site_ollama(
         "stream": False,
         "options": {
             "temperature": 0.3,
-            "num_predict": 512,
+            "num_predict": 1024,
         },
     }
 
@@ -415,11 +547,35 @@ async def analyze_site_ollama(
         raise RuntimeError(f"Ollama request failed: {exc}")
 
     data = resp.json()
-    raw_text = data.get("response", "").strip()
+    analysis_text = data.get("response", "").strip()
     logger.info(
         "Ollama (%s) analyzed '%s' — %d chars response",
-        model, site_name, len(raw_text),
+        model, site_name, len(analysis_text),
     )
 
-    return {"analysis": raw_text or "No analysis generated"}
+    # ── Pass 2: Per-cell crop descriptions (concurrent) ────────
+    cells = _crop_grid_cells(resized)
+
+    import concurrent.futures
+    cell_descriptions: dict[str, str] = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
+        futures = {
+            pool.submit(_describe_cell_sync, cell_bytes, tag, model, host): tag
+            for tag, cell_bytes in cells.items()
+        }
+        for future in concurrent.futures.as_completed(futures):
+            tag, desc = future.result()
+            cell_descriptions[tag] = desc
+
+    # Append grid annotations to the analysis text
+    grid_section = "\n\nGrid Annotations:"
+    tag_order = ["NW", "N", "NE", "W", "C", "E", "SW", "S", "SE"]
+    for tag in tag_order:
+        if tag in cell_descriptions:
+            grid_section += f"\n[{tag}] {cell_descriptions[tag]}"
+
+    full_analysis = (analysis_text or "No analysis generated") + grid_section
+    logger.info("Per-cell descriptions complete for '%s'", site_name)
+
+    return {"analysis": full_analysis}
 
