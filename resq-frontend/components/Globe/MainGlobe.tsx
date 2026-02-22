@@ -9,20 +9,16 @@ import type { FeatureCollection, Feature, Geometry } from "geojson";
 import { geoCentroid } from "d3-geo";
 import { fetchFundingScores } from "@/lib/api";
 import { scoreToColor, scoreToSideColor } from "@/lib/utils";
-import { m49ToIso3, iso3ToM49 } from "@/lib/countryCodeMap";
+import { m49ToIso3 } from "@/lib/countryCodeMap";
 import type { RegionMarker } from "@/data/majorCities";
 
-// react-globe.gl must be client-only (uses WebGL / window)
 const Globe = dynamic(() => import("react-globe.gl"), { ssr: false });
 
 const WORLD_TOPO_URL =
     "https://cdn.jsdelivr.net/npm/world-atlas@2/countries-110m.json";
 
-/** Default camera altitude (fully zoomed out). */
 const DEFAULT_ALTITUDE = 2.5;
-/** Camera altitude when focused on a country. */
 const FOCUS_ALTITUDE = 1.6;
-/** Transition duration in ms for the rotate/zoom animation. */
 const TRANSITION_MS = 1000;
 
 interface CountryFeature extends Feature<Geometry> {
@@ -46,10 +42,18 @@ interface MainGlobeProps {
     focusCountryCode?: string | null;
     onCountryClick?: (country: CountryFeature, score: number) => void;
     onCountryHover?: (country: CountryFeature | null) => void;
-    /** Major cities/regions to show as clickable markers. */
     regionMarkers?: RegionMarker[];
-    /** Called when a region marker is clicked. */
     onRegionClick?: (region: RegionMarker) => void;
+}
+
+/* Severity → soft color for the ring highlight */
+function markerColor(marker: any): string {
+    const needs = marker.needs ?? [];
+    if (needs.some((n: any) => n.severity === "critical"))
+        return "rgba(239, 68, 68, 0.7)";   // soft red
+    if (needs.some((n: any) => n.severity === "high"))
+        return "rgba(249, 115, 22, 0.65)";  // soft orange
+    return "rgba(96, 165, 250, 0.6)";       // soft blue
 }
 
 export default function MainGlobe({
@@ -69,7 +73,6 @@ export default function MainGlobe({
         queryFn: fetchFundingScores,
     });
 
-    // Load TopoJSON → GeoJSON
     useEffect(() => {
         fetch(WORLD_TOPO_URL)
             .then((r) => r.json())
@@ -82,7 +85,6 @@ export default function MainGlobe({
             });
     }, []);
 
-    // Track window size for responsive globe
     useEffect(() => {
         const update = () =>
             setDimensions({ width: window.innerWidth, height: window.innerHeight });
@@ -91,15 +93,21 @@ export default function MainGlobe({
         return () => window.removeEventListener("resize", update);
     }, []);
 
-
-    // ---- Helpers ---- //
-
     const getIso = useCallback((feat: CountryFeature): string => {
+        // 1. Try numeric ID (M49)
         const numericId =
             typeof feat.id === "number"
                 ? String(feat.id).padStart(3, "0")
                 : String(feat.id ?? "");
-        return m49ToIso3[numericId] ?? numericId;
+
+        const iso = m49ToIso3[numericId];
+        if (iso) return iso;
+
+        // 2. Fallback to properties (common in natural earth / world-atlas)
+        const propIso = (feat.properties?.iso_a3 || feat.properties?.ISO_A3) as string;
+        if (propIso && propIso !== "-99") return propIso;
+
+        return numericId;
     }, []);
 
     const getScore = useCallback(
@@ -110,41 +118,27 @@ export default function MainGlobe({
         [scores, getIso]
     );
 
-    // ---- Focus / zoom animation ---- //
-
-    /** Find the feature matching an ISO-3 code. */
     const featureByIso = useMemo(() => {
         const map = new Map<string, CountryFeature>();
-        for (const feat of countries) {
-            map.set(getIso(feat), feat);
-        }
+        for (const feat of countries) map.set(getIso(feat), feat);
         return map;
     }, [countries, getIso]);
 
-    /** Animate to the centroid of a feature. */
-    const focusOnFeature = useCallback(
-        (feat: CountryFeature) => {
-            const gl = globeRef.current;
-            if (!gl?.pointOfView) return;
+    const focusOnFeature = useCallback((feat: CountryFeature) => {
+        const gl = globeRef.current;
+        if (!gl?.pointOfView) return;
+        const [lng, lat] = geoCentroid(feat);
+        gl.pointOfView({ lat, lng, altitude: FOCUS_ALTITUDE }, TRANSITION_MS);
+    }, []);
 
-            const [lng, lat] = geoCentroid(feat);
-            gl.pointOfView({ lat, lng, altitude: FOCUS_ALTITUDE }, TRANSITION_MS);
-        },
-        []
-    );
-
-    /** React to external focus requests (e.g. search). */
     useEffect(() => {
         if (!focusCountryCode) {
-            // Reset: zoom out
             setSelectedIso(null);
             const gl = globeRef.current;
-            if (gl?.pointOfView) {
+            if (gl?.pointOfView)
                 gl.pointOfView({ altitude: DEFAULT_ALTITUDE }, TRANSITION_MS);
-            }
             return;
         }
-
         const feat = featureByIso.get(focusCountryCode);
         if (feat) {
             setSelectedIso(focusCountryCode);
@@ -152,19 +146,15 @@ export default function MainGlobe({
         }
     }, [focusCountryCode, featureByIso, focusOnFeature]);
 
-    // ---- Rendering callbacks ---- //
+    /* ---- Polygon rendering ---- */
 
     const capColor = useCallback(
         (feat: object) => {
             const f = feat as CountryFeature;
             const iso = getIso(f);
             const s = getScore(f);
-
-            // Highlight selected country with a bright accent
-            if (iso === selectedIso) {
+            if (iso === selectedIso)
                 return s >= 0 ? scoreToColor(s) : "rgba(100, 140, 255, 0.8)";
-            }
-
             if (s < 0) return "rgba(30, 30, 50, 0.6)";
             return scoreToColor(s);
         },
@@ -176,11 +166,8 @@ export default function MainGlobe({
             const f = feat as CountryFeature;
             const iso = getIso(f);
             const s = getScore(f);
-
-            if (iso === selectedIso) {
+            if (iso === selectedIso)
                 return s >= 0 ? scoreToColor(s) : "rgba(100, 140, 255, 0.6)";
-            }
-
             if (s < 0) return "rgba(30, 30, 50, 0.3)";
             return scoreToSideColor(s);
         },
@@ -203,10 +190,7 @@ export default function MainGlobe({
             const f = feat as CountryFeature;
             const iso = getIso(f);
             const s = getScore(f);
-
-            // Elevate the selected country so it pops out
             if (iso === selectedIso) return 0.06;
-
             return s >= 0 ? 0.01 + s * 0.02 : 0.005;
         },
         [getScore, getIso, selectedIso]
@@ -215,10 +199,18 @@ export default function MainGlobe({
     const label = useCallback(
         (feat: object) => {
             const f = feat as CountryFeature;
+            const iso = getIso(f);
             const s = getScore(f);
             const name = f.properties?.name ?? "Unknown";
-            const scoreText =
-                s >= 0 ? `${(s * 100).toFixed(1)}% funded` : "No data";
+
+            // If we have markers for this country, it's a "Crisis Context Found"
+            const hasMarkers = regionMarkers.some(m => m.countryCode === iso);
+
+            let scoreText = s >= 0 ? `${(s * 100).toFixed(1)}% funded` : "No funding data";
+            if (s < 0 && hasMarkers) {
+                scoreText = "Crisis Data Available";
+            }
+
             return `
         <div style="
           background: rgba(10,10,20,0.85);
@@ -232,14 +224,40 @@ export default function MainGlobe({
           border: 1px solid rgba(255,255,255,0.1);
         ">
           <strong style="font-size: 14px;">${name}</strong><br/>
-          <span style="color: ${s >= 0 ? scoreToColor(s) : "#888"};">
+          <span style="color: ${s >= 0 ? scoreToColor(s) : (hasMarkers ? "#3b82f6" : "#888")};">
             ${scoreText}
           </span>
-        </div>
-      `;
+        </div>`;
         },
-        [getScore]
+        [getScore, getIso, regionMarkers]
     );
+
+    /* ---- Marker label tooltip ---- */
+    const pointLabel = useCallback((d: object) => {
+        const m = d as any;
+        const needs = m.needs ?? [];
+        const needCount = needs.length;
+        const worst = needs.some((n: any) => n.severity === "critical")
+            ? "Critical"
+            : needs.some((n: any) => n.severity === "high")
+                ? "High"
+                : "Moderate";
+        return `
+        <div style="
+          background: rgba(10,10,20,0.9);
+          backdrop-filter: blur(8px);
+          color: white;
+          padding: 6px 12px;
+          border-radius: 6px;
+          font-family: system-ui;
+          font-size: 12px;
+          line-height: 1.4;
+          border: 1px solid rgba(255,255,255,0.12);
+        ">
+          <strong>${m.name}</strong><br/>
+          <span style="color: #9ca3af;">${needCount} sector${needCount !== 1 ? "s" : ""} · ${worst}</span>
+        </div>`;
+    }, []);
 
     return (
         <Globe
@@ -268,13 +286,25 @@ export default function MainGlobe({
             polygonsTransitionDuration={300}
             atmosphereColor="#3a7ecf"
             atmosphereAltitude={0.2}
+
+            /* Soft ring highlights at each crisis city */
+            ringsData={regionMarkers}
+            ringLat={(d: object) => (d as any).lat}
+            ringLng={(d: object) => (d as any).lng}
+            ringAltitude={0.07}
+            ringColor={(d: object) => markerColor(d)}
+            ringMaxRadius={1.2}
+            ringPropagationSpeed={0}
+            ringRepeatPeriod={0}
+
+            /* Small dot at center of each ring */
             pointsData={regionMarkers}
             pointLat="lat"
             pointLng="lng"
-            pointLabel={(d: object) => (d as RegionMarker).name}
-            pointColor={() => "rgba(255, 200, 100, 0.9)"}
-            pointAltitude={0.02}
-            pointRadius={0.4}
+            pointLabel={pointLabel}
+            pointColor={(d: object) => markerColor(d)}
+            pointAltitude={0.08}
+            pointRadius={0.6}
             pointsMerge={false}
             onPointClick={(d: object) => {
                 const r = d as RegionMarker;

@@ -1081,12 +1081,12 @@ async def _openrouter_generate(prompt: str, *, max_tokens: int = 1200) -> str | 
     return None
 
 
-async def _llm_generate(prompt: str, *, max_tokens: int = 1200) -> str | None:
+async def _llm_generate(prompt: str, *, max_tokens: int = 4000) -> str | None:
     """Generate text via OpenRouter."""
     return await _openrouter_generate(prompt, max_tokens=max_tokens)
 
 
-async def generate_with_openrouter(prompt: str, *, max_tokens: int = 2000) -> str | None:
+async def generate_with_openrouter(prompt: str, *, max_tokens: int = 4000) -> str | None:
     """Public entry point for OpenRouter chat (same model as Layer 3). Used by crisis_query etc."""
     return await _openrouter_generate(prompt, max_tokens=max_tokens)
 
@@ -1151,12 +1151,19 @@ async def synthesize_briefing(
 #  SECTION 6 — HIGH-LEVEL ORCHESTRATORS (API Integration)
 # ═══════════════════════════════════════════════════════════════════════════
 
+_INGEST_CACHE: dict[str, float] = {}
+
 async def ingest_country(country: str, limit: int = 10) -> int:
     """End-to-end: fetch all sources -> chunk -> ingest into Actian.
 
     Sources: GDACS, HDX CKAN, US State Dept, HDX HAPI, Google News.
     Returns the total number of vectors stored.
     """
+    country_lower = country.lower().strip()
+    if country_lower in _INGEST_CACHE and time.time() - _INGEST_CACHE[country_lower] < 3600:
+        logger.info("Skipping ingest for %s (already ingested < 1hr ago)", country)
+        return 0
+
     results = await asyncio.gather(
         fetch_gdacs_alerts(country, min_level="Green"),
         fetch_hdx_reports(country, limit=limit),
@@ -1186,6 +1193,7 @@ async def ingest_country(country: str, limit: int = 10) -> int:
         return 0
 
     stored = await ingest_intelligence(country, text_list)
+    _INGEST_CACHE[country_lower] = time.time()
     return stored
 
 

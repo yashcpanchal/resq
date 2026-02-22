@@ -1,0 +1,1 @@
+{"data": {"lat": 12.1842561, "lng": 18.6842092, "name": "Mongo", "analysis": "VLM analysis unavailable: Ollama request failed: 500 Server Error: Internal Server Error for url: http://localhost:11434/api/generate", "sectors": {}, "geojson": {"type": "FeatureCollection", "features": []}, "annotated_image": ""}, "ts": 1771755992.7806976}

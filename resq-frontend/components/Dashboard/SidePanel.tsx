@@ -2,11 +2,11 @@
 
 import { useState, useEffect } from "react";
 import { motion, AnimatePresence } from "framer-motion";
-import { X, Crosshair, Loader2, ExternalLink } from "lucide-react";
+import { X, Crosshair, Loader2, ExternalLink, ShieldAlert, Info } from "lucide-react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { scoreToColor } from "@/lib/utils";
-import { fetchTacticalAnalysis, type TacticalAnalysisResult } from "@/lib/api";
+import { fetchTacticalAnalysis, type TacticalAnalysisResult, fetchSafetyReport } from "@/lib/api";
 
 interface SidePanelProps {
     country: string | null;
@@ -23,6 +23,8 @@ function scoreBadge(score: number) {
     return { label: "Adequate", variant: "secondary" as const };
 }
 
+const safetyCache: Record<string, string> = {};
+
 export default function SidePanel({ country, score, lat, lng, onClose }: SidePanelProps) {
     const badge = scoreBadge(score);
     const hasCoords = lat !== undefined && lng !== undefined;
@@ -33,11 +35,40 @@ export default function SidePanel({ country, score, lat, lng, onClose }: SidePan
     const [tacticalResult, setTacticalResult] = useState<TacticalAnalysisResult | null>(null);
     const [tacticalError, setTacticalError] = useState("");
 
+    const [safetyState, setSafetyState] = useState<"idle" | "loading" | "done" | "error">("idle");
+    const [safetyReport, setSafetyReport] = useState<string | null>(null);
+
     useEffect(() => {
         setTacticalState("idle");
         setTacticalResult(null);
         setTacticalError("");
+        setSafetyState("idle");
+        setSafetyReport(null);
+
+        if (hasCoords) {
+            loadSafety(lat!, lng!);
+        }
     }, [country, lat, lng]);
+
+    const loadSafety = async (lat: number, lng: number) => {
+        const key = `${lat.toFixed(4)},${lng.toFixed(4)}`;
+        if (safetyCache[key]) {
+            setSafetyReport(safetyCache[key]);
+            setSafetyState("done");
+            return;
+        }
+
+        setSafetyState("loading");
+        try {
+            const { report } = await fetchSafetyReport(lat, lng);
+            safetyCache[key] = report;
+            setSafetyReport(report);
+            setSafetyState("done");
+        } catch (err) {
+            console.error("Safety fetch failed:", err);
+            setSafetyState("error");
+        }
+    };
 
     const runAnalysis = async () => {
         if (!hasCoords) return;
@@ -107,37 +138,50 @@ export default function SidePanel({ country, score, lat, lng, onClose }: SidePan
                                     </p>
                                 </div>
 
-                                {/* Interpretation */}
-                                <div className="space-y-3">
-                                    <div className="rounded-lg bg-white/5 p-3">
-                                        <p className="text-xs text-gray-400 uppercase tracking-wider mb-1">
-                                            Interpretation
-                                        </p>
-                                        <p className="text-sm text-gray-200 leading-relaxed">
-                                            {score < 0 &&
-                                                "No funding data available for this country."}
-                                            {score >= 0 &&
-                                                score < 0.3 &&
-                                                "This country is critically underfunded. Humanitarian operations may be severely hampered."}
-                                            {score >= 0.3 &&
-                                                score < 0.6 &&
-                                                "Funding covers less than 60% of requirements. Significant gaps remain in aid delivery."}
-                                            {score >= 0.6 &&
-                                                score < 0.85 &&
-                                                "Funding is moderate but gaps persist in some sectors."}
-                                            {score >= 0.85 &&
-                                                "Funding requirements are largely met for this country."}
-                                        </p>
+                                {/* Actian Safety Briefing (Layer 3) */}
+                                {hasCoords && (
+                                    <div className="space-y-3 border-t border-white/10 pt-4">
+                                        <div className="flex items-center gap-2">
+                                            <ShieldAlert size={14} className="text-blue-400" />
+                                            <p className="text-xs text-blue-400 uppercase tracking-wider">
+                                                Actian Safety Briefing
+                                            </p>
+                                        </div>
+
+                                        {safetyState === "loading" && (
+                                            <div className="flex items-center gap-3 py-4 px-3 rounded-lg bg-blue-500/5 border border-blue-500/10">
+                                                <Loader2 size={16} className="animate-spin text-blue-400" />
+                                                <p className="text-xs text-gray-400 italic">Synthesizing intelligence...</p>
+                                            </div>
+                                        )}
+
+                                        {safetyState === "done" && safetyReport && (
+                                            <div className="rounded-lg bg-white/5 border border-white/10 p-3 max-h-[300px] overflow-y-auto scrollbar-thin scrollbar-thumb-white/10">
+                                                <div className="text-[13px] text-gray-200 leading-relaxed whitespace-pre-wrap font-sans">
+                                                    {safetyReport.replace(/^## .*?\n/, "")}
+                                                </div>
+                                            </div>
+                                        )}
+
+                                        {safetyState === "error" && (
+                                            <div className="rounded-lg bg-red-500/5 border border-red-500/10 p-3 flex items-start gap-2">
+                                                <Info size={14} className="text-red-400 mt-0.5" />
+                                                <p className="text-xs text-red-400/80 italic">Briefing unavailable. Country ingestion may still be in progress.</p>
+                                            </div>
+                                        )}
                                     </div>
-                                </div>
+                                )}
 
                                 {/* Tactical Analysis Section */}
                                 {hasCoords && (
                                     <div className="space-y-3 border-t border-white/10 pt-4">
                                         <div className="flex items-center justify-between">
-                                            <p className="text-xs text-gray-400 uppercase tracking-wider">
-                                                Tactical Analysis
-                                            </p>
+                                            <div className="flex items-center gap-2">
+                                                <Crosshair size={14} className="text-green-400" />
+                                                <p className="text-xs text-green-400 uppercase tracking-wider">
+                                                    Tactical Analysis
+                                                </p>
+                                            </div>
                                             <span className="text-[10px] text-gray-600 font-mono tabular-nums">
                                                 {lat!.toFixed(4)}°N {lng!.toFixed(4)}°E
                                             </span>

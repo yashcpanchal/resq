@@ -138,23 +138,30 @@ class SafetyByCountryResponse(BaseModel):
     lng: float | None
     report: str
 
-# ---------- Context Engine (L3) ---------- #
 
-class IngestRequest(BaseModel):
+# ---------- Layer 1.5 (City-level Crisis Discovery) ---------- #
+
+class CrisisNeed(BaseModel):
+    sector: str
+    severity: str
+    description: str
+    affected_population: str | None = None
+    funding_gap: str | None = None
+
+
+class CityCrisis(BaseModel):
+    name: str
+    lat: float
+    lng: float
+    needs: list[CrisisNeed]
+    crises: list[dict] = []  # Compatibility with existing frontend logic
+
+
+class CountryCrisesRequest(BaseModel):
     country: str
 
 
-class IngestResponse(BaseModel):
+class CountryCrisesResponse(BaseModel):
     country: str
-    chunks_ingested: int
-
-
-class SafetyByCountryRequest(BaseModel):
-    country: str
-
-
-class SafetyByCountryResponse(BaseModel):
-    country: str
-    lat: float | None
-    lng: float | None
-    report: str
+    cities: list[CityCrisis]
+    sources_note: str = ""

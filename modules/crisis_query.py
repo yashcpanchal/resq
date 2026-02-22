@@ -8,14 +8,77 @@ UN OCHA, ReliefWeb, WHO, UNHCR, WFP, IPC, and FEWS NET reports.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
 import re
+import time
 from datetime import datetime, timezone
+import hashlib
 from typing import Any
 
+import httpx
+
 logger = logging.getLogger(__name__)
+
+NOMINATIM_SEARCH = "https://nominatim.openstreetmap.org/search"
+
+# ---------------------------------------------------------------------------
+# Persistent file-based cache (data/crisis_cache/)
+# ---------------------------------------------------------------------------
+_CACHE_DIR = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "data",
+    "crisis_cache"
+)
+os.makedirs(_CACHE_DIR, exist_ok=True)
+_CACHE_TTL = 3600  # 1 hour
+
+def _get_cache_path(country: str) -> str:
+    """Hash country name to create a safe filename."""
+    h = hashlib.md5(country.lower().encode()).hexdigest()
+    return os.path.join(_CACHE_DIR, f"{h}.json")
+
+def _load_cache(country: str) -> dict[str, Any] | None:
+    path = _get_cache_path(country)
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            entry = json.load(f)
+            if time.time() - entry.get("ts", 0) < _CACHE_TTL:
+                return entry.get("data")
+    except Exception:
+        pass
+    return None
+
+def _save_cache(country: str, data: dict[str, Any]):
+    path = _get_cache_path(country)
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({"data": data, "ts": time.time()}, f)
+    except Exception as e:
+        logger.warning("Failed to save crisis cache for %s: %s", country, e)
+
+
+async def _geocode_city(city_name: str, country: str) -> tuple[float, float] | None:
+    """Resolve city name + country to (lat, lng) coordinates."""
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get(
+                NOMINATIM_SEARCH,
+                params={"q": f"{city_name}, {country}", "format": "json", "limit": 1},
+                headers={"User-Agent": "ResQ-Capital/0.1"},
+            )
+            resp.raise_for_status()
+            results = resp.json()
+            if results:
+                return (float(results[0]["lat"]), float(results[0]["lon"]))
+        return None
+    except Exception as exc:
+        logger.error("Geocoding failed for %s, %s: %s", city_name, country, exc)
+        return None
 
 
 def _current_date_str() -> str:
@@ -48,8 +111,8 @@ For each major city or area with significant needs, provide:
    - **funding_gap**: underfunding data if known (e.g. "HRP 34% funded", "WASH cluster received $12M of $89M needed"), or null
 
 REQUIREMENTS:
-- 10-15+ cities/locations covering the FULL humanitarian picture
-- Front-line cities, displacement hubs, disease hotspots, food crisis zones, infrastructure damage areas
+- 5-8 cities/locations covering the key humanitarian hotspots
+- Prioritize: front-line cities, displacement hubs, worst-affected areas
 - Population-level issues ONLY — no individual stories, no single-person anecdotes
 - Use real statistics: IPC phases, displacement figures, attack counts, disease case numbers, funding percentages
 - If you know the HRP funding status, include it in sources_note
@@ -107,12 +170,26 @@ def _parse_response(country: str, raw: str) -> dict[str, Any]:
     try:
         data = json.loads(text)
     except json.JSONDecodeError:
-        logger.warning("JSON parse failed on %d chars", len(text))
-        out["cities"] = [{"name": "Parse error", "needs": [
-            {"sector": "Other", "severity": "high", "description": raw[:800],
-             "affected_population": None, "funding_gap": None}
-        ]}]
-        return out
+        logger.warning("JSON parse failed on %d chars. Attempting partial repair.", len(text))
+        # Remove trailing unclosed string/list/dict
+        cleaned = re.sub(r',?\s*"[^"]*$', "", text)
+        cleaned = re.sub(r',?\s*\{[^{}]*$', "", cleaned)
+        cleaned = re.sub(r',?\s*\[[^[\]]*$', "", cleaned)
+        # Attempt to close open brackets/braces blindly
+        try:
+            cleaned = cleaned + "}]}]}"
+            data = json.loads(cleaned)
+        except json.JSONDecodeError:
+            try:
+                # Attempt slightly different closing
+                cleaned = text.rsplit('"needs": [', 1)[0] + '"needs": []}]}'
+                data = json.loads(cleaned)
+            except:
+                out["cities"] = [{"name": "Parse error", "needs": [
+                    {"sector": "Other", "severity": "high", "description": raw[:800],
+                     "affected_population": None, "funding_gap": None}
+                ]}]
+                return out
 
     out["country"] = data.get("country", country)
     out["sources_note"] = data.get("sources_note", "")
@@ -170,19 +247,44 @@ def _parse_response(country: str, raw: str) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 async def get_crises_for_country(country: str) -> dict[str, Any]:
-    """Return city-level humanitarian needs for a country.
-
-    Uses the Layer 3 LLM with a substantive prompt to produce
-    structured relief assessment data.
+    """Discover 5-8 city-level humanitarian crises for a given country.
+    Uses persistent caching to avoid redundant LLM calls.
     """
     if not (country or "").strip():
         return {"country": "", "cities": [], "sources_note": ""}
 
+    country = country.strip()
+    cached = _load_cache(country)
+    if cached:
+        logger.info("Crisis cache hit for %s", country)
+        return cached
+
+    logger.info("Starting crisis discovery for %s ...", country)
+
     from modules.context_engine import generate_with_openrouter
 
-    country = country.strip()
     date = _current_date_str()
     prompt = SYSTEM + "\n\n" + PROMPT_TEMPLATE.format(country=country, date=date)
 
     raw = await generate_with_openrouter(prompt, max_tokens=4000)
-    return _parse_response(country, raw or "")
+    data = _parse_response(country, raw or "")
+
+    # Resolve coordinates for each city
+    async def _populate_coords(city: dict[str, Any]):
+        coords = await _geocode_city(city["name"], country)
+        if coords:
+            city["lat"], city["lng"] = coords
+        else:
+            city["lat"], city["lng"] = 0.0, 0.0
+
+    if data.get("cities"):
+        await asyncio.gather(*[_populate_coords(c) for c in data["cities"]])
+
+    # Only cache if we didn't get a parse error
+    if data.get("cities") and data["cities"][0].get("name") != "Parse error":
+        _save_cache(country, data)
+        logger.info("Persisted crises for %s (%d cities)", country, len(data.get("cities", [])))
+    else:
+        logger.warning("Not caching crises for %s due to missing data or parse error", country)
+
+    return data
