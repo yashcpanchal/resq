@@ -38,6 +38,7 @@ function TacticalContent() {
   const paramLat = params.get("lat");
   const paramLng = params.get("lng");
   const paramName = params.get("name") ?? "Location";
+  const isEmbed = params.get("embed") === "true";
 
   const hasParams = paramLat !== null && paramLng !== null;
   const center = hasParams
@@ -76,28 +77,30 @@ function TacticalContent() {
 
   return (
     <>
-      <header className="flex shrink-0 items-center justify-between border-b border-white/10 px-4 py-2">
-        <div className="flex items-center gap-4">
-          <Link
-            href="/"
-            className="text-sm text-gray-400 hover:text-white transition"
-          >
-            &larr; Globe
-          </Link>
-          <h1 className="text-base font-bold text-white/90 tracking-tight">
-            Tactical Grid
-          </h1>
-          <span className="text-xs text-gray-500">
-            {name} &middot; {center.lat.toFixed(4)}&deg;N {center.lng.toFixed(4)}&deg;E
-          </span>
-        </div>
-        {state === "loading" && (
-          <div className="flex items-center gap-2 text-green-400">
-            <Loader2 size={14} className="animate-spin" />
-            <span className="text-xs">Analyzing...</span>
+      {!isEmbed && (
+        <header className="flex shrink-0 items-center justify-between border-b border-white/10 px-4 py-2">
+          <div className="flex items-center gap-4">
+            <Link
+              href="/"
+              className="text-sm text-gray-400 hover:text-white transition"
+            >
+              &larr; Globe
+            </Link>
+            <h1 className="text-base font-bold text-white/90 tracking-tight">
+              Tactical Grid
+            </h1>
+            <span className="text-xs text-gray-500">
+              {name} &middot; {center.lat.toFixed(4)}&deg;N {center.lng.toFixed(4)}&deg;E
+            </span>
           </div>
-        )}
-      </header>
+          {state === "loading" && (
+            <div className="flex items-center gap-2 text-green-400">
+              <Loader2 size={14} className="animate-spin" />
+              <span className="text-xs">Analyzing...</span>
+            </div>
+          )}
+        </header>
+      )}
 
       <div className="relative flex-1 min-h-0">
         {state === "error" && (
@@ -112,12 +115,50 @@ function TacticalContent() {
           </div>
         )}
         {(state === "done" || !hasParams) && (
-          <TacticalGrid
-            center={center}
-            analysis={analysis}
-            sectors={sectors}
-            geojson={geojson}
-          />
+          <div className="absolute inset-0 z-0 flex bg-gray-950">
+            <div className="flex-1 relative h-full">
+              <TacticalGrid
+                center={center}
+                analysis={analysis}
+                sectors={sectors}
+                geojson={geojson}
+              />
+            </div>
+            {/* Sidebar for Sector Descriptions */}
+            {!isEmbed && (
+              <div className="w-[340px] shrink-0 border-l border-white/10 bg-gray-950/95 backdrop-blur overflow-y-auto [&::-webkit-scrollbar]:w-2 [&::-webkit-scrollbar-track]:bg-transparent [&::-webkit-scrollbar-thumb]:bg-white/10 hover:[&::-webkit-scrollbar-thumb]:bg-white/20 [&::-webkit-scrollbar-thumb]:rounded-full p-4 shadow-[inset_1px_0_10px_rgba(0,0,0,0.5)] z-[1001]">
+                <h2 className="text-sm font-bold text-white mb-4 flex items-center gap-2">
+                  <span className="w-1.5 h-1.5 rounded-full bg-green-400 shadow-[0_0_6px_rgba(0,255,136,0.6)] animate-pulse" />
+                  SECTOR INTELLIGENCE
+                </h2>
+                <div className="space-y-3">
+                  {sectors && Object.keys(sectors).length > 0 ? (
+                    Object.entries(sectors).map(([tag, desc]) => (
+                      <div key={tag} className="bg-white/5 border border-white/10 rounded-lg p-3">
+                        <div className="text-[11px] font-bold text-green-400 mb-1">[{tag}] SECTOR</div>
+                        <div className="text-xs text-gray-300 leading-relaxed font-sans">{desc}</div>
+                      </div>
+                    ))
+                  ) : (
+                    analysis.split('\n').filter(Boolean).map((line, i) => {
+                      const match = line.match(/^\[(.*?)\]\s*(.*)$/);
+                      if (match) {
+                        return (
+                          <div key={i} className="bg-white/5 border border-white/10 rounded-lg p-3">
+                            <div className="text-[11px] font-bold text-green-400 mb-1">[{match[1]}] SECTOR</div>
+                            <div className="text-xs text-gray-300 leading-relaxed font-sans">{match[2]}</div>
+                          </div>
+                        );
+                      }
+                      return (
+                        <div key={i} className="text-xs text-gray-400 leading-relaxed font-sans">{line}</div>
+                      );
+                    })
+                  )}
+                </div>
+              </div>
+            )}
+          </div>
         )}
         {state === "loading" && (
           <div className="flex h-full items-center justify-center bg-gray-950">

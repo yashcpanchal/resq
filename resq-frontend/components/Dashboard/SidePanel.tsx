@@ -26,6 +26,59 @@ function scoreBadge(score: number) {
 
 const safetyCache: Record<string, string> = {};
 
+function FormattedBriefing({ text }: { text: string }) {
+    if (!text) return null;
+    let parts: { id: number, title: string, body: string }[] = [];
+
+    // If it's the raw fallback data
+    if (text.includes("---")) {
+        const chunks = text.split("---").map(p => p.trim()).filter(Boolean);
+        parts = chunks.map((part, i) => {
+            let content = part.replace(/^\[\d+\]\s*/, "").trim();
+            if (content.startsWith("Source: Raw retrieved data")) return null;
+            let category = "Intel Report";
+            const catMatch = content.match(/^\[(.*?)\]\s*([\s\S]*)/);
+            if (catMatch) {
+                category = catMatch[1];
+                content = catMatch[2];
+            }
+            return { id: i, title: category, body: content };
+        }).filter(Boolean) as any;
+    } else {
+        const paragraphs = text.split(/\n\n+/).map(p => p.trim()).filter(Boolean);
+        let currentTitle = "Operational Context";
+        let currentBody: string[] = [];
+        for (const p of paragraphs) {
+            const headingMatch = p.match(/^#+\s+(.*)$/) || p.match(/^\*\*(.*?)\*\*$/) || p.match(/^([A-Z][a-zA-Z\s]+):$/);
+            if (headingMatch && p.length < 120) {
+                if (currentBody.length > 0) {
+                    parts.push({ id: parts.length, title: currentTitle, body: currentBody.join("\n\n") });
+                    currentBody = [];
+                }
+                currentTitle = headingMatch[1].replace(/\*\*/g, "");
+            } else {
+                currentBody.push(p.replace(/^\*\*(.*?)\*\*\s*/, "$1: "));
+            }
+        }
+        if (currentBody.length > 0) {
+            parts.push({ id: parts.length, title: currentTitle, body: currentBody.join("\n\n") });
+        }
+    }
+
+    return (
+        <div className="space-y-3 mt-2 max-h-[400px] overflow-y-auto [&::-webkit-scrollbar]:w-2 [&::-webkit-scrollbar-track]:bg-transparent [&::-webkit-scrollbar-thumb]:bg-white/10 hover:[&::-webkit-scrollbar-thumb]:bg-white/20 [&::-webkit-scrollbar-thumb]:rounded-full pr-1">
+            {parts.map(p => (
+                <div key={p.id} className="p-3 rounded-lg bg-white/5 border border-white/10 space-y-1.5">
+                    <p className="text-[11px] font-bold text-blue-400 uppercase tracking-wider">{p.title}</p>
+                    <div className="text-[12px] text-gray-300 leading-relaxed whitespace-pre-wrap">
+                        {p.body}
+                    </div>
+                </div>
+            ))}
+        </div>
+    );
+}
+
 export default function SidePanel({ country, score, scoreDomain = [0, 1], lat, lng, onClose }: SidePanelProps) {
     const badge = scoreBadge(score);
     const hasCoords = lat !== undefined && lng !== undefined;
@@ -149,7 +202,7 @@ export default function SidePanel({ country, score, scoreDomain = [0, 1], lat, l
                                         <div className="flex items-center gap-2">
                                             <ShieldAlert size={14} className="text-blue-400" />
                                             <p className="text-xs text-blue-400 uppercase tracking-wider">
-                                                Actian Safety Briefing
+                                                Operational Context Briefing
                                             </p>
                                         </div>
 
@@ -161,11 +214,7 @@ export default function SidePanel({ country, score, scoreDomain = [0, 1], lat, l
                                         )}
 
                                         {safetyState === "done" && safetyReport && (
-                                            <div className="rounded-lg bg-white/5 border border-white/10 p-3 max-h-[300px] overflow-y-auto scrollbar-thin scrollbar-thumb-white/10">
-                                                <div className="text-[13px] text-gray-200 leading-relaxed whitespace-pre-wrap font-sans">
-                                                    {safetyReport.replace(/^## .*?\n/, "")}
-                                                </div>
-                                            </div>
+                                            <FormattedBriefing text={safetyReport} />
                                         )}
 
                                         {safetyState === "error" && (
@@ -177,112 +226,7 @@ export default function SidePanel({ country, score, scoreDomain = [0, 1], lat, l
                                     </div>
                                 )}
 
-                                {/* Tactical Analysis Section */}
-                                {hasCoords && (
-                                    <div className="space-y-3 border-t border-white/10 pt-4">
-                                        <div className="flex items-center justify-between">
-                                            <div className="flex items-center gap-2">
-                                                <Crosshair size={14} className="text-green-400" />
-                                                <p className="text-xs text-green-400 uppercase tracking-wider">
-                                                    Tactical Analysis
-                                                </p>
-                                            </div>
-                                            <span className="text-[10px] text-gray-600 font-mono tabular-nums">
-                                                {lat!.toFixed(4)}°N {lng!.toFixed(4)}°E
-                                            </span>
-                                        </div>
 
-                                        {tacticalState === "idle" && (
-                                            <button
-                                                onClick={runAnalysis}
-                                                className="w-full flex items-center justify-center gap-2 rounded-lg bg-green-500/10 border border-green-500/20 px-4 py-2.5 text-sm text-green-400 hover:bg-green-500/20 transition"
-                                            >
-                                                <Crosshair size={14} />
-                                                Run VLM Analysis
-                                            </button>
-                                        )}
-
-                                        {tacticalState === "loading" && (
-                                            <div className="flex flex-col items-center gap-2 py-6">
-                                                <Loader2 size={24} className="animate-spin text-green-400" />
-                                                <p className="text-xs text-gray-400">
-                                                    Running Ollama VLM analysis...
-                                                </p>
-                                                <p className="text-[10px] text-gray-600">
-                                                    This may take 30-120 seconds
-                                                </p>
-                                            </div>
-                                        )}
-
-                                        {tacticalState === "error" && (
-                                            <div className="space-y-2">
-                                                <div className="rounded-lg bg-red-500/10 border border-red-500/20 p-3">
-                                                    <p className="text-xs text-red-400">
-                                                        {tacticalError}
-                                                    </p>
-                                                </div>
-                                                <button
-                                                    onClick={runAnalysis}
-                                                    className="w-full flex items-center justify-center gap-2 rounded-lg bg-white/5 px-4 py-2 text-xs text-gray-400 hover:bg-white/10 transition"
-                                                >
-                                                    Retry
-                                                </button>
-                                            </div>
-                                        )}
-
-                                        {tacticalState === "done" && tacticalResult && (
-                                            <div className="space-y-3">
-                                                {/* Annotated satellite thumbnail */}
-                                                {tacticalResult.annotated_image && (
-                                                    <div className="rounded-lg overflow-hidden border border-white/10">
-                                                        <img
-                                                            src={`data:image/jpeg;base64,${tacticalResult.annotated_image}`}
-                                                            alt="Annotated satellite view"
-                                                            className="w-full h-auto"
-                                                        />
-                                                    </div>
-                                                )}
-
-                                                {/* Sector summary */}
-                                                {Object.keys(tacticalResult.sectors).length > 0 && (
-                                                    <div className="rounded-lg bg-white/5 p-3 space-y-2">
-                                                        <p className="text-xs text-gray-400 uppercase tracking-wider mb-1">
-                                                            Sector Summary
-                                                        </p>
-                                                        {Object.entries(tacticalResult.sectors)
-                                                            .slice(0, 5)
-                                                            .map(([tag, desc]) => (
-                                                                <div key={tag} className="flex gap-2 text-xs">
-                                                                    <span className="text-green-400/80 font-mono font-bold shrink-0">
-                                                                        [{tag}]
-                                                                    </span>
-                                                                    <span className="text-gray-300 line-clamp-2">
-                                                                        {desc}
-                                                                    </span>
-                                                                </div>
-                                                            ))}
-                                                        {Object.keys(tacticalResult.sectors).length > 5 && (
-                                                            <p className="text-[10px] text-gray-600">
-                                                                +{Object.keys(tacticalResult.sectors).length - 5} more sectors
-                                                            </p>
-                                                        )}
-                                                    </div>
-                                                )}
-
-                                                {/* View Full Grid link */}
-                                                {tacticalUrl && (
-                                                    <a
-                                                        href={tacticalUrl}
-                                                        className="w-full flex items-center justify-center gap-2 rounded-lg bg-green-500/10 border border-green-500/20 px-4 py-2.5 text-sm text-green-400 hover:bg-green-500/20 transition"
-                                                    >
-                                                        <ExternalLink size={14} />
-                                                        View Full Tactical Grid
-                                                    </a>
-                                                )}
-                                            </div>
-                                        )}
-                                    </div>
-                                )}
                             </CardContent>
                         </Card>
                     </div>
