@@ -8,85 +8,99 @@
     <Architecture>
         <DesignPattern>Modular Service Pattern</DesignPattern>
         <Philosophy>Isolation of concerns. Each module (pipeline, vision, vector, synthesis) should be functional and testable independently.</Philosophy>
-        <Orchestration>app.py (Streamlit) acts as the central hub, importing logic from the modules/ directory.</Orchestration>
+        <Orchestration>FastAPI (app:app) is the central API; Next.js (resq-frontend) is the main UI. Backend logic lives in modules/ and api/.</Orchestration>
         <DataFlow>
-            <Step order="1" source="Databricks (pipeline.py)" destination="data/neglect_scores.json">Ingest and calculate neglect scores.</Step>
-            <Step order="2" source="modules/vision.py &amp; modules/vector.py" trigger="Coordinate Consumption">Validate logistical and safety context.</Step>
-            <Step order="3" source="synthesis.py (Sphinx)" trigger="Combination">Generate deployment plan memo.</Step>
+            <Step order="1" source="Databricks / pipeline.py" destination="data/neglect_scores.json">Ingest and calculate neglect scores; funding scores from FTS CSV (optional).</Step>
+            <Step order="2" source="modules/vision.py, modules/ground_verifier.py, modules/osm_features.py" trigger="Coordinate / country click">Satellite imagery (Esri), Ollama VLM analysis, Overpass OSM features for tactical grid.</Step>
+            <Step order="3" source="modules/vector.py" trigger="Coordinate">Safety report via RAG.</Step>
+            <Step order="4" source="modules/synthesis.py" trigger="Combination">Generate deployment plan memo.</Step>
         </DataFlow>
     </Architecture>
 
     <TechStack>
-        <Track sponsor="Databricks" challenge="Geo-Insight">
-            <Component>Core Engine (PySpark/Python)</Component>
-        </Track>
-        <Track sponsor="GrowthFactor" challenge="Parking Detection">
-            <Component>Logistics (CV/Satellite)</Component>
-        </Track>
-        <Track sponsor="Actian" challenge="VectorAI">
-            <Component>Safety RAG (VectorAI)</Component>
-        </Track>
-        <Track sponsor="Sphinx" challenge="Unique Application">
-            <Component>Intelligence (LLM)</Component>
-        </Track>
-        <Track sponsor="SafetyKit" challenge="Human Safety">
-            <Component>Safety Layer</Component>
-        </Track>
+        <Backend>FastAPI, Uvicorn, Pydantic. Python 3.x.</Backend>
+        <Frontend>Next.js (App Router), React, Tailwind, react-globe.gl (globe), react-leaflet (tactical map).</Backend>
+        <Satellite>Esri World Imagery (free), Pillow, Ollama (VLM: llava/moondream), Overpass API (OSM).</Satellite>
+        <Track sponsor="Databricks" challenge="Geo-Insight"><Component>Core Engine (PySpark/Python)</Component></Track>
+        <Track sponsor="GrowthFactor" challenge="Parking Detection"><Component>Logistics (CV/Satellite)</Component></Track>
+        <Track sponsor="Actian" challenge="VectorAI"><Component>Safety RAG (VectorAI)</Component></Track>
+        <Track sponsor="Sphinx" challenge="Unique Application"><Component>Intelligence (LLM)</Component></Track>
+        <Track sponsor="SafetyKit" challenge="Human Safety"><Component>Safety Layer</Component></Track>
     </TechStack>
 
     <RepositoryStructure>
-        <Folder name="resq-capital">
-            <Folder name="data">
-                <Description>Shared JSON/CSV outputs</Description>
+        <Folder name="resq-1">
+            <Folder name="api">
+                <File name="schemas.py">Pydantic request/response models (pipeline, vision, tactical, aid sites, synthesis).</File>
+                <File name="routes.py">Main API router: health, neglect-scores, funding-scores, parking, safety, memo, aid-sites.</File>
+                <Folder name="routes">
+                    <File name="vision.py">Vision router: tactical-analysis (VLM + OSM grid), aid-sites.</File>
+                    <File name="pipeline.py">Pipeline router: funding-scores, neglect-scores.</File>
+                </Folder>
             </Folder>
             <Folder name="modules">
-                <File name="pipeline.py">P1: ACAPS/FTS Data Engineering</File>
-                <File name="vision.py">P2: Satellite CV logic</File>
-                <File name="vector.py">P2: Actian RAG logic</File>
-                <File name="synthesis.py">P3: Sphinx Prompting</File>
+                <File name="pipeline.py">P1: FTS funding scores (CSV), get_neglect_scores().</File>
+                <File name="vision.py">P2: get_parking_capacity (satellite CV).</File>
+                <File name="ground_verifier.py">Esri satellite fetch, Ollama VLM analysis, analyze_location().</File>
+                <File name="osm_features.py">Overpass API: buildings, roads, landuse, leisure, amenities (schools, hospitals); 3x3 grid sectors; GeoJSON for tactical map.</File>
+                <File name="osm_finder.py">OSMNx staging candidates (optional).</File>
+                <File name="candidate_verification.py">find_aid_sites(), analyze_location() (VLM + image).</File>
+                <File name="vector.py">P2: get_safety_report (RAG).</File>
+                <File name="synthesis.py">P3: generate_memo.</File>
             </Folder>
-            <File name="app.py">Main Dashboard (Streamlit)</File>
-            <File name=".env">Secrets and API Keys</File>
-            <File name="requirements.txt">Shared dependencies</File>
+            <Folder name="resq-frontend">
+                <Folder name="app">
+                    <File name="page.tsx">Globe, side panel, country click → funding scores, tactical analysis entry.</File>
+                    <Folder name="tactical"><File name="page.tsx">Full tactical grid page (lat/lng/name from query).</File></Folder>
+                    <Folder name="api"><File name="tactical-analysis/route.ts">Proxy to backend with long timeout (5 min).</File></Folder>
+                </Folder>
+                <Folder name="components">
+                    <File name="Globe/MainGlobe.tsx">3D globe, country click with lat/lng.</File>
+                    <File name="Dashboard/SidePanel.tsx">Country info, Run VLM Analysis, link to tactical grid.</File>
+                    <File name="TacticalGrid.tsx">Leaflet map, OSM GeoJSON overlay (staging/risk/access/operations), tooltips.</File>
+                </Folder>
+                <File name="lib/api.ts">fetchFundingScores(), fetchTacticalAnalysis().</File>
+            </Folder>
+            <Folder name="data"><Description>Optional: funding CSV, neglect_scores.json</Description></Folder>
+            <File name="app.py">FastAPI entry; uvicorn app:app.</File>
+            <File name="requirements.txt">Python backend dependencies.</File>
         </Folder>
     </RepositoryStructure>
 
+    <KeyEndpoints>
+        <Endpoint method="GET" path="/api/v1/health">Liveness.</Endpoint>
+        <Endpoint method="GET" path="/api/v1/funding-scores">Per-country funding score (empty if CSV missing).</Endpoint>
+        <Endpoint method="GET" path="/api/v1/neglect-scores">Neglect scores list.</Endpoint>
+        <Endpoint method="POST" path="/api/v1/tactical-analysis">Body: lat, lng, name?, model?. Returns VLM analysis, sectors, GeoJSON, annotated image (base64).</Endpoint>
+        <Endpoint method="POST" path="/api/v1/aid-sites">Body: lat, lng, radius_m?, max_sites?, model?. Aid site candidates + VLM analysis.</Endpoint>
+        <Endpoint method="POST" path="/api/v1/parking-capacity">Body: lat, lng.</Endpoint>
+        <Endpoint method="POST" path="/api/v1/safety-report">Body: lat, lng.</Endpoint>
+        <Endpoint method="POST" path="/api/v1/generate-memo">Body: memo request.</Endpoint>
+    </KeyEndpoints>
+
     <TeamRoles>
         <Role id="P1" title="Data Engineer">
-            <AssignedTo>Person 1</AssignedTo>
-            <OutputTarget>data/neglect_scores.json</OutputTarget>
-            <DataContract format="JSON">
-                <![CDATA[
-                {
-                  "crisis_id": "str",
-                  "country": "str",
-                  "coordinates": {"lat": 0.0, "lng": 0.0},
-                  "neglect_score": 0.0,
-                  "severity": 0,
-                  "funding_gap_usd": 0
-                }
-                ]]>
-            </DataContract>
+            <OutputTarget>data/neglect_scores.json, funding-scores API</OutputTarget>
         </Role>
         <Role id="P2" title="AI Specialist">
-            <AssignedTo>Person 2</AssignedTo>
             <Functions>
-                <Function name="get_parking_capacity">Returns integer count based on lat/lng.</Function>
-                <Function name="get_safety_report">Returns text summary via Actian.</Function>
+                <Function name="get_parking_capacity">Returns integer from lat/lng.</Function>
+                <Function name="get_safety_report">Text summary via RAG.</Function>
+                <Function name="analyze_location">Ollama VLM on satellite image; 3x3 sector descriptions.</Function>
+                <Function name="fetch_osm_features">Overpass GeoJSON for tactical grid (buildings, roads, landuse, schools, hospitals).</Function>
             </Functions>
         </Role>
         <Role id="P3" title="Product Architect">
-            <AssignedTo>Person 3</AssignedTo>
             <Functions>
-                <Function name="generate_memo">Calls Sphinx with aggregated data.</Function>
-                <Function name="ui_logic">Map visualization via Folium/Streamlit.</Function>
+                <Function name="generate_memo">Sphinx with aggregated data.</Function>
+                <Function name="ui_logic">Globe (react-globe.gl), tactical map (react-leaflet), side panel.</Function>
             </Functions>
         </Role>
     </TeamRoles>
 
     <StrategicGuardrails>
         <Guardrail id="1">Zero-Inference: Do not assume safety on missing data.</Guardrail>
-        <Guardrail id="2">Modular Imports: app.py must only import from modules/.</Guardrail>
+        <Guardrail id="2">Modular Imports: app must only import from api/ and modules/.</Guardrail>
         <Guardrail id="3">Mocking: Use mock functions for frontend stability if APIs are unstable.</Guardrail>
         <Guardrail id="4">SafetyKit Integration: Flag 'Logistics Red Alert' if neglect is high but parking is zero.</Guardrail>
     </StrategicGuardrails>

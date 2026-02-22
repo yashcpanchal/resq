@@ -77,7 +77,7 @@ class AidSiteRequest(BaseModel):
     lng: float
     radius_m: int = Field(default=5000, ge=100, le=20000)
     max_sites: int = Field(default=10, ge=1, le=50)
-    model: str = Field(default="moondream", description="Ollama vision model name")
+    model: str = Field(default="llava", description="Ollama vision model name")
 
 
 class AidSiteCandidate(BaseModel):
@@ -87,6 +87,7 @@ class AidSiteCandidate(BaseModel):
     lng: float
     osm_id: str
     analysis: str = ""
+    annotated_image: str = Field(default="", description="Base64-encoded annotated JPEG")
 
 
 class AidSiteResponse(BaseModel):
@@ -96,6 +97,8 @@ class AidSiteResponse(BaseModel):
     total_candidates: int
     analyzed_candidates: int
     sites: list[AidSiteCandidate]
+
+
 
 # ---------- Tactical Analysis ---------- #
 
