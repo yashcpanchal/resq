@@ -97,3 +97,42 @@ class AidSiteResponse(BaseModel):
     analyzed_candidates: int
     sites: list[AidSiteCandidate]
 
+# ---------- Tactical Analysis ---------- #
+
+class TacticalAnalysisRequest(BaseModel):
+    lat: float
+    lng: float
+    name: str = "Location"
+    model: str = Field(default="llava", description="Ollama vision model name")
+
+
+class TacticalAnalysisResponse(BaseModel):
+    lat: float
+    lng: float
+    name: str
+    analysis: str = Field(description="Full VLM analysis text")
+    sectors: dict[str, str] = Field(description="Per-sector descriptions keyed by grid tag")
+    geojson: dict = Field(description="GeoJSON FeatureCollection of OSM features with sector/type tags")
+    annotated_image: str = Field(default="", description="Base64-encoded annotated JPEG")
+
+
+# ---------- Context Engine (L3) ---------- #
+
+class IngestRequest(BaseModel):
+    country: str
+
+
+class IngestResponse(BaseModel):
+    country: str
+    chunks_ingested: int
+
+
+class SafetyByCountryRequest(BaseModel):
+    country: str
+
+
+class SafetyByCountryResponse(BaseModel):
+    country: str
+    lat: float | None
+    lng: float | None
+    report: str
