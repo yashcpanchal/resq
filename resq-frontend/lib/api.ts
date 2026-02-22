@@ -9,6 +9,12 @@ export async function fetchFundingScores(): Promise<Record<string, number>> {
     return res.json();
 }
 
+export async function fetchCrisisScores(): Promise<Record<string, number>> {
+    const res = await fetch("/api/crisis-scores");
+    if (!res.ok) throw new Error(`Failed to fetch crisis scores: ${res.status}`);
+    return res.json();
+}
+
 export interface TacticalAnalysisResult {
     lat: number;
     lng: number;

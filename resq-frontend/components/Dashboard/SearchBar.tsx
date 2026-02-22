@@ -3,21 +3,38 @@
 import { useState, useMemo } from "react";
 import { Search } from "lucide-react";
 import { useQuery } from "@tanstack/react-query";
-import { fetchFundingScores } from "@/lib/api";
+import { fetchFundingScores, fetchCrisisScores } from "@/lib/api";
 import { allCountryCodes, iso3ToName } from "@/lib/countryCodeMap";
+import type { ScoreMode } from "@/app/page";
 
 interface SearchBarProps {
     onSelect: (countryCode: string) => void;
+    scoreMode?: ScoreMode;
 }
 
-export default function SearchBar({ onSelect }: SearchBarProps) {
+export default function SearchBar({ onSelect, scoreMode = "funding" }: SearchBarProps) {
     const [query, setQuery] = useState("");
     const [open, setOpen] = useState(false);
 
-    const { data: scores = {} } = useQuery({
+    const { data: rawFundingScores = {} } = useQuery({
         queryKey: ["funding-scores"],
         queryFn: fetchFundingScores,
     });
+
+    const { data: rawCrisisScores = {} } = useQuery({
+        queryKey: ["crisis-scores"],
+        queryFn: fetchCrisisScores,
+    });
+
+    /* Scale and pick active dataset */
+    const scores = useMemo(() => {
+        const raw = scoreMode === "funding" ? rawFundingScores : rawCrisisScores;
+        const scaled: Record<string, number> = {};
+        for (const [k, v] of Object.entries(raw)) {
+            scaled[k] = v * -10000;
+        }
+        return scaled;
+    }, [rawFundingScores, rawCrisisScores, scoreMode]);
 
     const filtered = useMemo(() => {
         const q = query.trim().toLowerCase();
@@ -61,7 +78,7 @@ export default function SearchBar({ onSelect }: SearchBarProps) {
                     {filtered.map((code) => {
                         const name = iso3ToName[code] ?? code;
                         const score = scores[code];
-                        const hasScore = score !== undefined && score >= 0;
+                        const hasScore = score !== undefined;
                         return (
                             <button
                                 key={code}
@@ -80,7 +97,7 @@ export default function SearchBar({ onSelect }: SearchBarProps) {
                                 </span>
                                 <span className="text-gray-500 text-xs whitespace-nowrap">
                                     {hasScore
-                                        ? `${(score * 100).toFixed(1)}%`
+                                        ? score.toFixed(0)
                                         : "No data"}
                                 </span>
                             </button>

@@ -11,21 +11,22 @@ import { fetchTacticalAnalysis, type TacticalAnalysisResult, fetchSafetyReport }
 interface SidePanelProps {
     country: string | null;
     score: number;
+    scoreDomain?: [number, number];
     lat?: number;
     lng?: number;
     onClose: () => void;
 }
 
 function scoreBadge(score: number) {
-    if (score < 0) return { label: "No Data", variant: "secondary" as const };
-    if (score < 0.3) return { label: "Critical", variant: "destructive" as const };
-    if (score < 0.6) return { label: "Underfunded", variant: "default" as const };
+    if (isNaN(score)) return { label: "No Data", variant: "secondary" as const };
+    if (score < -5000) return { label: "Critical", variant: "destructive" as const };
+    if (score < 0) return { label: "Underfunded", variant: "default" as const };
     return { label: "Adequate", variant: "secondary" as const };
 }
 
 const safetyCache: Record<string, string> = {};
 
-export default function SidePanel({ country, score, lat, lng, onClose }: SidePanelProps) {
+export default function SidePanel({ country, score, scoreDomain = [0, 1], lat, lng, onClose }: SidePanelProps) {
     const badge = scoreBadge(score);
     const hasCoords = lat !== undefined && lng !== undefined;
 
@@ -125,16 +126,20 @@ export default function SidePanel({ country, score, lat, lng, onClose }: SidePan
                                     <div className="relative h-3 rounded-full bg-gray-800 overflow-hidden">
                                         <motion.div
                                             initial={{ width: 0 }}
-                                            animate={{ width: `${Math.max(score, 0) * 100}%` }}
+                                            animate={{
+                                                width: !isNaN(score)
+                                                    ? `${Math.min(Math.abs(score) / 100, 100)}%`
+                                                    : "0%",
+                                            }}
                                             transition={{ duration: 0.8, ease: "easeOut" }}
                                             className="h-full rounded-full"
                                             style={{
-                                                background: score >= 0 ? scoreToColor(score) : "#555",
+                                                background: !isNaN(score) ? scoreToColor(score, scoreDomain) : "#555",
                                             }}
                                         />
                                     </div>
-                                    <p className="text-right text-sm mt-1 font-mono" style={{ color: score >= 0 ? scoreToColor(score) : "#888" }}>
-                                        {score >= 0 ? `${(score * 100).toFixed(1)}%` : "N/A"}
+                                    <p className="text-right text-sm mt-1 font-mono" style={{ color: !isNaN(score) ? scoreToColor(score, scoreDomain) : "#888" }}>
+                                        {!isNaN(score) ? score.toFixed(0) : "N/A"}
                                     </p>
                                 </div>
 

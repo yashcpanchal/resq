@@ -7,10 +7,11 @@ import { feature } from "topojson-client";
 import type { Topology, GeometryCollection } from "topojson-specification";
 import type { FeatureCollection, Feature, Geometry } from "geojson";
 import { geoCentroid } from "d3-geo";
-import { fetchFundingScores } from "@/lib/api";
+import { fetchFundingScores, fetchCrisisScores } from "@/lib/api";
 import { scoreToColor, scoreToSideColor } from "@/lib/utils";
 import { m49ToIso3 } from "@/lib/countryCodeMap";
 import type { RegionMarker } from "@/data/majorCities";
+import type { ScoreMode } from "@/app/page";
 
 const Globe = dynamic(() => import("react-globe.gl"), { ssr: false });
 
@@ -44,6 +45,7 @@ interface MainGlobeProps {
     onCountryHover?: (country: CountryFeature | null) => void;
     regionMarkers?: RegionMarker[];
     onRegionClick?: (region: RegionMarker) => void;
+    scoreMode?: ScoreMode;
 }
 
 /* Severity → soft color for the ring highlight */
@@ -62,16 +64,40 @@ export default function MainGlobe({
     onCountryHover,
     regionMarkers = [],
     onRegionClick,
+    scoreMode = "funding",
 }: MainGlobeProps) {
     const globeRef = useRef<GlobeInstance | undefined>(undefined);
     const [countries, setCountries] = useState<CountryFeature[]>([]);
     const [dimensions, setDimensions] = useState({ width: 0, height: 0 });
     const [selectedIso, setSelectedIso] = useState<string | null>(null);
 
-    const { data: scores = {} } = useQuery({
+    const { data: rawFundingScores = {} } = useQuery({
         queryKey: ["funding-scores"],
         queryFn: fetchFundingScores,
     });
+
+    const { data: rawCrisisScores = {} } = useQuery({
+        queryKey: ["crisis-scores"],
+        queryFn: fetchCrisisScores,
+    });
+
+    /* Scale and pick active dataset based on scoreMode */
+    const scores = useMemo(() => {
+        const raw = scoreMode === "funding" ? rawFundingScores : rawCrisisScores;
+        const scaled: Record<string, number> = {};
+        for (const [k, v] of Object.entries(raw)) {
+            scaled[k] = v * -10000;
+        }
+        return scaled;
+    }, [rawFundingScores, rawCrisisScores, scoreMode]);
+
+    /* Compute the actual [min, max] domain from the scaled scores
+       so colours distribute evenly across the real data range. */
+    const scoreDomain = useMemo<[number, number]>(() => {
+        const vals = Object.values(scores);
+        if (vals.length === 0) return [-1, 1];
+        return [Math.min(...vals), Math.max(...vals)];
+    }, [scores]);
 
     useEffect(() => {
         fetch(WORLD_TOPO_URL)
@@ -113,7 +139,7 @@ export default function MainGlobe({
     const getScore = useCallback(
         (feat: CountryFeature): number => {
             const iso = getIso(feat);
-            return scores[iso] ?? -1;
+            return iso in scores ? scores[iso] : NaN;
         },
         [scores, getIso]
     );
@@ -154,11 +180,11 @@ export default function MainGlobe({
             const iso = getIso(f);
             const s = getScore(f);
             if (iso === selectedIso)
-                return s >= 0 ? scoreToColor(s) : "rgba(100, 140, 255, 0.8)";
-            if (s < 0) return "rgba(30, 30, 50, 0.6)";
-            return scoreToColor(s);
+                return !isNaN(s) ? scoreToColor(s, scoreDomain) : "rgba(100, 140, 255, 0.8)";
+            if (isNaN(s)) return "rgba(30, 30, 50, 0.6)";
+            return scoreToColor(s, scoreDomain);
         },
-        [getScore, getIso, selectedIso]
+        [getScore, getIso, selectedIso, scoreDomain]
     );
 
     const sideColor = useCallback(
@@ -167,11 +193,11 @@ export default function MainGlobe({
             const iso = getIso(f);
             const s = getScore(f);
             if (iso === selectedIso)
-                return s >= 0 ? scoreToColor(s) : "rgba(100, 140, 255, 0.6)";
-            if (s < 0) return "rgba(30, 30, 50, 0.3)";
-            return scoreToSideColor(s);
+                return !isNaN(s) ? scoreToColor(s, scoreDomain) : "rgba(100, 140, 255, 0.6)";
+            if (isNaN(s)) return "rgba(30, 30, 50, 0.3)";
+            return scoreToSideColor(s, scoreDomain);
         },
-        [getScore, getIso, selectedIso]
+        [getScore, getIso, selectedIso, scoreDomain]
     );
 
     const strokeColor = useCallback(
@@ -191,9 +217,14 @@ export default function MainGlobe({
             const iso = getIso(f);
             const s = getScore(f);
             if (iso === selectedIso) return 0.06;
-            return s >= 0 ? 0.01 + s * 0.02 : 0.005;
+            if (isNaN(s)) return 0.005;
+            // Use absolute value for altitude so negative scores still raise
+            const absNorm = scoreDomain[1] !== scoreDomain[0]
+                ? Math.abs(s) / Math.max(Math.abs(scoreDomain[0]), Math.abs(scoreDomain[1]))
+                : 0;
+            return 0.01 + absNorm * 0.02;
         },
-        [getScore, getIso, selectedIso]
+        [getScore, getIso, selectedIso, scoreDomain]
     );
 
     const label = useCallback(
@@ -203,11 +234,11 @@ export default function MainGlobe({
             const s = getScore(f);
             const name = f.properties?.name ?? "Unknown";
 
-            // If we have markers for this country, it's a "Crisis Context Found"
             const hasMarkers = regionMarkers.some(m => m.countryCode === iso);
+            const modeLabel = scoreMode === "funding" ? "Funding Gap" : "Crisis Score";
 
-            let scoreText = s >= 0 ? `${(s * 100).toFixed(1)}% funded` : "No funding data";
-            if (s < 0 && hasMarkers) {
+            let scoreText = !isNaN(s) ? `${modeLabel}: ${s.toFixed(0)}` : "No data";
+            if (isNaN(s) && hasMarkers) {
                 scoreText = "Crisis Data Available";
             }
 
@@ -224,12 +255,12 @@ export default function MainGlobe({
           border: 1px solid rgba(255,255,255,0.1);
         ">
           <strong style="font-size: 14px;">${name}</strong><br/>
-          <span style="color: ${s >= 0 ? scoreToColor(s) : (hasMarkers ? "#3b82f6" : "#888")};">
+          <span style="color: ${!isNaN(s) ? scoreToColor(s, scoreDomain) : (hasMarkers ? "#3b82f6" : "#888")};">
             ${scoreText}
           </span>
         </div>`;
         },
-        [getScore, getIso, regionMarkers]
+        [getScore, getIso, regionMarkers, scoreDomain, scoreMode]
     );
 
     /* ---- Marker label tooltip ---- */

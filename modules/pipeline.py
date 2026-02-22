@@ -14,6 +14,9 @@ import csv
 import os
 from collections import defaultdict
 from typing import Any
+from dotenv import load_dotenv
+
+from databricks import sql
 
 # Path to the FTS funding CSV relative to the project root.
 _CSV_PATH = os.path.join(
@@ -25,76 +28,58 @@ _CSV_PATH = os.path.join(
 
 
 def calculate_funding_scores() -> dict[str, float]:
-    """Calculate a funding score for each country.
-
-    Score = total funding received / total funding required.
-    Uses the columns ``funding`` (received) and ``requirements`` (needed)
-    from the FTS global-cluster CSV.
+    """Fetch funding gaps by querying the Databricks table.
 
     Returns:
-        A dict mapping ISO-3 country code to its funding score,
-        e.g. ``{"AFG": 0.4231, "BDI": 0.5012, ...}``.
+        A dict mapping country code to its funding_gap,
+        e.g. ``{"AFG": 0.42, "SDN": 0.78, ...}``.
     """
-    totals: dict[str, dict[str, float]] = defaultdict(
-        lambda: {"funding": 0.0, "requirements": 0.0}
+    load_dotenv()
+    connection = sql.connect(
+        server_hostname=os.getenv("DATABRICKS_HOSTNAME"),
+        http_path=os.getenv("DATABRICKS_HTTP_PATH"),
+        access_token=os.getenv("DATABRICKS_TOKEN"),
+        auth_type="pat" # Explicitly tell it you're using a Personal Access Token
     )
+    
+    cursor = connection.cursor()
 
-    if not os.path.exists(_CSV_PATH):
-        # Fallback to some curated scores for major crisis areas if the file is missing
-        return {
-            "SDN": 0.3421,  # Sudan
-            "SSD": 0.2815,  # South Sudan
-            "UKR": 0.5422,  # Ukraine
-            "PSE": 0.1245,  # Palestine
-            "YEM": 0.4102,  # Yemen
-            "AFG": 0.3954,  # Afghanistan
-            "SYR": 0.4821,  # Syria
-            "IND": 0.6542,  # India
-            "ETH": 0.3211,  # Ethiopia
-            "MMR": 0.2944,  # Myanmar
-        }
-
-    with open(_CSV_PATH, newline="", encoding="utf-8") as fh:
-        reader = csv.DictReader(fh)
-        for row in reader:
-            # Skip the HXL tag row (values start with '#')
-            country_code = row.get("countryCode", "")
-            if not country_code or country_code.startswith("#"):
-                continue
-
-            funding_str = row.get("funding", "").strip()
-            requirements_str = row.get("requirements", "").strip()
-
-            funding = float(funding_str) if funding_str else 0.0
-            requirements = float(requirements_str) if requirements_str else 0.0
-
-            totals[country_code]["funding"] += funding
-            totals[country_code]["requirements"] += requirements
-
-    scores: dict[str, float] = {}
-    for country_code, vals in totals.items():
-        if vals["requirements"] > 0:
-            scores[country_code] = round(
-                vals["funding"] / vals["requirements"], 4
-            )
-        else:
-            scores[country_code] = 0.0
-
-    return scores
-
-
-async def get_neglect_scores() -> list[dict[str, Any]]:
-    """Fetch and compute neglect scores for global crises.
-
-    Returns a list of dicts matching the data contract:
-        {
-            "crisis_id": str,
-            "country": str,
-            "coordinates": {"lat": float, "lng": float},
-            "neglect_score": float,
-            "severity": int,
-            "funding_gap_usd": int,
-        }
+    query = """
+        SELECT country, funding_gap
+        FROM workspace.`final-data`.final_scores
+        ORDER BY funding_gap DESC
     """
-    # TODO: Implement Databricks / PySpark ingestion
-    return []
+
+    cursor.execute(query)
+    result = {row[0]: row[1] for row in cursor.fetchall()}
+
+    cursor.close()
+    connection.close()
+
+    return result
+
+
+async def get_crisis_scores() -> list[dict[str, Any]]:
+    load_dotenv()
+    connection = sql.connect(
+        server_hostname=os.getenv("DATABRICKS_HOSTNAME"),
+        http_path=os.getenv("DATABRICKS_HTTP_PATH"),
+        access_token=os.getenv("DATABRICKS_TOKEN"),
+        auth_type="pat" # Explicitly tell it you're using a Personal Access Token
+    )
+    
+    cursor = connection.cursor()
+
+    query = """
+        SELECT country, final_score
+        FROM workspace.`final-data`.final_scores
+        ORDER BY final_score DESC
+    """
+
+    cursor.execute(query)
+    result = {row[0]: row[1] for row in cursor.fetchall()}
+
+    cursor.close()
+    connection.close()
+
+    return result

@@ -6,11 +6,14 @@ import HeatmapLegend from "@/components/Globe/HeatmapLegend";
 import SidePanel from "@/components/Dashboard/SidePanel";
 import LeftPanel from "@/components/Dashboard/LeftPanel";
 import SearchBar from "@/components/Dashboard/SearchBar";
+import ScoreToggle from "@/components/Dashboard/ScoreToggle";
 import { useQuery } from "@tanstack/react-query";
-import { fetchFundingScores, fetchCountryCrises, triggerIngest } from "@/lib/api";
+import { fetchFundingScores, fetchCrisisScores, fetchCountryCrises, triggerIngest } from "@/lib/api";
 import type { CityCrisis } from "@/lib/api";
 import { m49ToIso3, iso3ToName } from "@/lib/countryCodeMap";
 import type { RegionMarker } from "@/data/majorCities";
+
+export type ScoreMode = "funding" | "crisis";
 
 // Globe is heavy + needs window — load only on client
 const MainGlobe = dynamic(() => import("@/components/Globe/MainGlobe"), {
@@ -36,6 +39,7 @@ export default function Home() {
   const [selectedRegion, setSelectedRegion] = useState<(RegionMarker | CityCrisis) | null>(null);
   const [discoveredCrises, setDiscoveredCrises] = useState<CityCrisis[]>([]);
   const [loadingCrises, setLoadingCrises] = useState(false);
+  const [scoreMode, setScoreMode] = useState<ScoreMode>("funding");
 
   // Cache: country name -> { cities: CityCrisis[], ts: number }
   useEffect(() => {
@@ -64,10 +68,43 @@ export default function Home() {
     } as RegionMarker & Partial<CityCrisis>));
   }, [discoveredCrises, selected?.code]);
 
-  const { data: scores = {} } = useQuery({
+  const { data: rawFundingScores = {} } = useQuery({
     queryKey: ["funding-scores"],
     queryFn: fetchFundingScores,
   });
+
+  const { data: rawCrisisScores = {} } = useQuery({
+    queryKey: ["crisis-scores"],
+    queryFn: fetchCrisisScores,
+  });
+
+  /* Scale funding scores by -10,000 so underfunded countries are negative */
+  const fundingScores = useMemo(() => {
+    const scaled: Record<string, number> = {};
+    for (const [k, v] of Object.entries(rawFundingScores)) {
+      scaled[k] = v * -10000;
+    }
+    return scaled;
+  }, [rawFundingScores]);
+
+  /* Scale crisis scores by -10,000 same way */
+  const crisisScores = useMemo(() => {
+    const scaled: Record<string, number> = {};
+    for (const [k, v] of Object.entries(rawCrisisScores)) {
+      scaled[k] = v * -10000;
+    }
+    return scaled;
+  }, [rawCrisisScores]);
+
+  /* Pick active scores based on toggle */
+  const scores = scoreMode === "funding" ? fundingScores : crisisScores;
+
+  /* Compute [min, max] domain so all colour components stay in sync */
+  const scoreDomain = useMemo<[number, number]>(() => {
+    const vals = Object.values(scores);
+    if (vals.length === 0) return [-1, 1];
+    return [Math.min(...vals), Math.max(...vals)];
+  }, [scores]);
 
   const loadCrises = useCallback(async (countryName: string) => {
     // Check frontend cache first
@@ -128,7 +165,7 @@ export default function Home() {
       setSelected({
         name,
         code,
-        score: scores[code] ?? -1,
+        score: code in scores ? scores[code] : NaN,
       });
       loadCrises(name);
     },
@@ -168,16 +205,19 @@ export default function Home() {
         </p>
       </div>
 
-      <SearchBar onSelect={handleSearchSelect} />
+      <SearchBar onSelect={handleSearchSelect} scoreMode={scoreMode} />
+
+      <ScoreToggle activeMode={scoreMode} onChange={setScoreMode} />
 
       <MainGlobe
         focusCountryCode={selected?.code ?? null}
         onCountryClick={handleCountryClick}
         regionMarkers={regionMarkers}
         onRegionClick={handleRegionClick}
+        scoreMode={scoreMode}
       />
 
-      <HeatmapLegend />
+      <HeatmapLegend domain={scoreDomain} scoreMode={scoreMode} />
 
       <LeftPanel
         countryName={selected?.name ?? null}
@@ -191,6 +231,7 @@ export default function Home() {
       <SidePanel
         country={selected?.name ?? null}
         score={selected?.score ?? -1}
+        scoreDomain={scoreDomain}
         lat={selectedRegion?.lat}
         lng={selectedRegion?.lng}
         onClose={handleCloseLeftPanel}

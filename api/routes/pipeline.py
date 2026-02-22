@@ -6,8 +6,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter
 
-from api.schemas import NeglectScore
-from modules.pipeline import calculate_funding_scores, get_neglect_scores
+from modules.pipeline import calculate_funding_scores, get_crisis_scores
 
 router = APIRouter()
 
@@ -21,11 +20,10 @@ async def health():
 
 # ---- Pipeline ---- #
 
-@router.get("/neglect-scores", response_model=list[NeglectScore])
-async def neglect_scores():
-    """Return computed neglect scores for all tracked crises."""
-    data = await get_neglect_scores()
-    return data
+@router.get("/crisis-scores")
+async def crisis_scores():
+    """Return crisis final_score per country."""
+    return await get_crisis_scores()
 
 
 @router.get("/funding-scores")
