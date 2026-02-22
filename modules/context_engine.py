@@ -893,28 +893,13 @@ async def ingest_intelligence(
             for text in text_list
         ]
 
-        # Batch upsert into Actian VectorAI (with auto-recovery on corruption)
-        try:
-            client.batch_upsert(
-                COLLECTION_NAME,
-                ids=ids,
-                vectors=vectors,
-                payloads=payloads,
-            )
-        except Exception as upsert_exc:
-            logger.warning(
-                "batch_upsert failed (%s) — recreating collection and retrying",
-                upsert_exc,
-            )
-            _recreate_collection(client)
-            _next_id = 0
-            ids = list(range(0, len(text_list)))
-            client.batch_upsert(
-                COLLECTION_NAME,
-                ids=ids,
-                vectors=vectors,
-                payloads=payloads,
-            )
+        # Batch upsert into Actian VectorAI
+        client.batch_upsert(
+            COLLECTION_NAME,
+            ids=ids,
+            vectors=vectors,
+            payloads=payloads,
+        )
 
         _next_id += len(text_list)
         logger.info(
@@ -1098,6 +1083,11 @@ async def _openrouter_generate(prompt: str, *, max_tokens: int = 1200) -> str | 
 
 async def _llm_generate(prompt: str, *, max_tokens: int = 1200) -> str | None:
     """Generate text via OpenRouter."""
+    return await _openrouter_generate(prompt, max_tokens=max_tokens)
+
+
+async def generate_with_openrouter(prompt: str, *, max_tokens: int = 2000) -> str | None:
+    """Public entry point for OpenRouter chat (same model as Layer 3). Used by crisis_query etc."""
     return await _openrouter_generate(prompt, max_tokens=max_tokens)
 
 

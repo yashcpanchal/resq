@@ -62,14 +62,13 @@
 
         <Layer3 name="Context Engine — Operational Intelligence">
             <DataSources>
-                <Source name="GDACS">Natural disaster alerts (RSS); country-filtered for ingest; proximity-based (e.g. 500 km) for lat/lng reports.</Source>
+                <Source name="GDACS">Natural disaster alerts (RSS); filtered by country and severity (Orange/Red for display).</Source>
                 <Source name="HDX CKAN">Humanitarian dataset metadata; filtered by ISO3 country group (fq=groups:xxx) for accurate country scope.</Source>
                 <Source name="US State Dept">Travel advisories and CountryTravelInformation (safety, health, transport); no auth.</Source>
                 <Source name="HDX HAPI">Structured data: conflict events (ACLED), food security (IPC); app_identifier required, no API key.</Source>
-                <Source name="Google News RSS">Breaking news (last 7 days); country-level and city-specific; always fetched live at report time; no auth.</Source>
+                <Source name="Google News RSS">Breaking news (last 7 days); always fetched live at report time; no auth.</Source>
             </DataSources>
-            <Output>Operational field briefing: What Changed This Week, Operating Environment, Key Risks, Local Situation (when city/region given), Operational Recommendations. Synthesized via OpenRouter from RAG chunks and live news (including city-level and nearby GDACS). ReliefWeb not used (requires pre-approved app name).</Output>
-            <Ingest>Ingest loads GDACS, HDX, State Dept, HAPI, News per country into Actian; supports all 202 countries (country_codes). Auto-recovers from Actian collection corruption by recreating collection and retrying.</Ingest>
+            <Output>Operational field briefing for humanitarian workers: What Changed This Week, Operating Environment, Key Risks, Operational Recommendations. Synthesized via OpenRouter from retrieved chunks and live news. ReliefWeb not used (requires pre-approved app name).</Output>
         </Layer3>
 
         <Track category="Backend Framework">
