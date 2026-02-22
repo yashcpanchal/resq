@@ -21,6 +21,7 @@ Usage:
 from __future__ import annotations
 
 import asyncio
+import base64
 import logging
 from typing import Any
 
@@ -28,6 +29,7 @@ from modules.ground_verifier import (
     analyze_site_ollama,
     fetch_satellite_image_esri,
 )
+from modules.image_annotator import annotate_image
 from modules.osm_finder import find_staging_candidates
 
 logger = logging.getLogger(__name__)
@@ -38,12 +40,13 @@ MAX_VERIFY = 10
 
 async def _analyze_single(
     candidate: dict[str, Any],
-    model: str = "moondream",
+    model: str = "llava",
     ollama_host: str | None = None,
 ) -> dict[str, Any]:
     """Fetch satellite image + run Ollama VLM for one candidate site.
 
-    Returns the original candidate dict with an 'analysis' text field.
+    Returns the original candidate dict with 'analysis' text and
+    'annotated_image' (base64 JPEG) fields.
     On failure, returns a safe fallback so the pipeline never crashes.
     """
     try:
@@ -51,6 +54,7 @@ async def _analyze_single(
         image_bytes = fetch_satellite_image_esri(
             lat=candidate["lat"],
             lng=candidate["lng"],
+            grid=3,  # 3×3 tiles = 768×768 for sharp annotated images
         )
 
         # Step B — VLM analysis (Ollama — local, free)
@@ -62,7 +66,16 @@ async def _analyze_single(
             ollama_host=ollama_host,
         )
 
-        return {**candidate, **result}
+        # Step C — Annotate image with visual overlays
+        analysis_text = result.get("analysis", "")
+        annotated_bytes = annotate_image(
+            image_bytes=image_bytes,
+            analysis_text=analysis_text,
+            site_name=candidate["name"],
+        )
+        annotated_b64 = base64.b64encode(annotated_bytes).decode("utf-8")
+
+        return {**candidate, **result, "annotated_image": annotated_b64}
 
     except Exception as exc:
         logger.warning(
@@ -71,7 +84,84 @@ async def _analyze_single(
         return {
             **candidate,
             "analysis": f"Analysis failed: {exc}",
+            "annotated_image": "",
         }
+
+
+async def analyze_location(
+    lat: float,
+    lng: float,
+    name: str = "Location",
+    model: str = "llava",
+    ollama_host: str | None = None,
+) -> dict[str, Any]:
+    """One-call entry point: satellite image → VLM analysis → annotated image.
+
+    Takes a lat/lng, fetches satellite imagery, runs VLM (Ollama) analysis,
+    and produces an annotated image with map-style labels.
+
+    Args:
+        lat: Latitude of the target location.
+        lng: Longitude of the target location.
+        name: Human-readable name for the location (used in title bar).
+        model: Ollama model name (default ``"llava"``).
+        ollama_host: Optional Ollama API URL override.
+
+    Returns:
+        A dict with::
+
+            {
+                "lat": float,
+                "lng": float,
+                "name": str,
+                "analysis": str,           # Full VLM analysis text
+                "annotated_image": str,     # Base64-encoded annotated JPEG
+                "raw_image": str,           # Base64-encoded original satellite JPEG
+            }
+
+    Example::
+
+        import asyncio
+        from modules.candidate_verification import analyze_location
+
+        result = asyncio.run(analyze_location(31.5017, 34.4668, name="Gaza School"))
+        print(result["analysis"])
+
+        # Save annotated image
+        import base64
+        with open("annotated.jpg", "wb") as f:
+            f.write(base64.b64decode(result["annotated_image"]))
+    """
+    # Step 1 — Fetch satellite image
+    image_bytes = fetch_satellite_image_esri(lat=lat, lng=lng, grid=3)
+    raw_b64 = base64.b64encode(image_bytes).decode("utf-8")
+
+    # Step 2 — VLM analysis (full image + per-cell crops)
+    result = await analyze_site_ollama(
+        image_bytes=image_bytes,
+        site_name=name,
+        category="location",
+        model=model,
+        ollama_host=ollama_host,
+    )
+    analysis_text = result.get("analysis", "")
+
+    # Step 3 — Annotate image
+    annotated_bytes = annotate_image(
+        image_bytes=image_bytes,
+        analysis_text=analysis_text,
+        site_name=name,
+    )
+    annotated_b64 = base64.b64encode(annotated_bytes).decode("utf-8")
+
+    return {
+        "lat": lat,
+        "lng": lng,
+        "name": name,
+        "analysis": analysis_text,
+        "annotated_image": annotated_b64,
+        "raw_image": raw_b64,
+    }
 
 
 async def find_aid_sites(
@@ -79,7 +169,7 @@ async def find_aid_sites(
     lng: float,
     radius_m: int = 5000,
     max_sites: int = MAX_VERIFY,
-    model: str = "moondream",
+    model: str = "llava",
     ollama_host: str | None = None,
 ) -> list[dict[str, Any]]:
     """Find nearby locations that can receive humanitarian aid and generate
@@ -98,7 +188,7 @@ async def find_aid_sites(
         lng: Longitude of the crisis zone centre.
         radius_m: Search radius in metres (default 5 000 m).
         max_sites: Maximum sites to analyze with the VLM (default 10).
-        model: Ollama vision model name (default ``"moondream"``).
+        model: Ollama vision model name (default ``"llava"``).
         ollama_host: Optional Ollama URL (default ``http://localhost:11434``).
 
     Returns:
@@ -145,7 +235,11 @@ async def find_aid_sites(
 
     # Tag any remaining candidates as not-yet-analyzed
     remaining = [
-        {**c, "analysis": "Not analyzed — increase max_sites to include"}
+        {
+            **c,
+            "analysis": "Not analyzed — increase max_sites to include",
+            "annotated_image": "",
+        }
         for c in candidates[max_sites:]
     ]
 
@@ -162,7 +256,7 @@ async def get_best_aid_site(
     lat: float,
     lng: float,
     radius_m: int = 5000,
-    model: str = "moondream",
+    model: str = "llava",
     ollama_host: str | None = None,
 ) -> dict[str, Any] | None:
     """Convenience wrapper — return the single highest-priority viable site.
@@ -192,7 +286,7 @@ if __name__ == "__main__":
     parser.add_argument("lng", type=float, help="Longitude")
     parser.add_argument("--radius", type=int, default=5000, help="Search radius in metres")
     parser.add_argument("--max-sites", type=int, default=10, help="Max sites to analyze")
-    parser.add_argument("--model", default="moondream", help="Ollama model name")
+    parser.add_argument("--model", default="llava", help="Ollama model name")
     parser.add_argument("--json", action="store_true", help="Output raw JSON")
     args = parser.parse_args()
 
