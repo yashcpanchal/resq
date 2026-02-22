@@ -47,7 +47,7 @@ export default function LeftPanel({
   // Build the tactical page URL from the city's coordinates
   const tacticalUrl =
     selectedRegion?.lat && selectedRegion?.lng
-      ? `/tactical?lat=${selectedRegion.lat}&lng=${selectedRegion.lng}&name=${encodeURIComponent(selectedRegion.name)}`
+      ? `/tactical?lat=${selectedRegion.lat}&lng=${selectedRegion.lng}&name=${encodeURIComponent(selectedRegion.name)}&embed=true`
       : null;
 
   return (
@@ -62,7 +62,7 @@ export default function LeftPanel({
             transition={{ type: "spring", damping: 26, stiffness: 200 }}
             className="absolute left-0 top-0 z-30 h-full w-[400px] max-w-full"
           >
-            <div className="h-full overflow-y-auto p-4 scrollbar-thin scrollbar-thumb-white/10 scrollbar-track-transparent hover:scrollbar-thumb-white/20 transition-colors">
+            <div className="h-full overflow-y-auto p-4 [&::-webkit-scrollbar]:w-2 [&::-webkit-scrollbar-track]:bg-transparent [&::-webkit-scrollbar-thumb]:bg-white/10 [&::-webkit-scrollbar-thumb]:rounded-full hover:[&::-webkit-scrollbar-thumb]:bg-white/20 transition-colors">
               <Card className="bg-gray-950/90 backdrop-blur-2xl border-white/10 text-white shadow-2xl">
                 <CardHeader className="flex flex-row items-start justify-between pb-2">
                   <div className="flex items-center gap-2">

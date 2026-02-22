@@ -22,7 +22,7 @@
             </Step>
             
             <Step order="2" phase="Validation" source="modules/context_engine.py + modules/vector.py (Actian)" trigger="On-Demand API Call">
-                When a user selects a crisis or country, FastAPI triggers: (1) live Google News fetch for breaking news; (2) vector search in Actian for stored intel (GDACS, HDX, State Dept, HAPI); (3) LLM synthesis (OpenRouter) into an operational field briefing. Resulting briefing and risk context feed SafetyKit and the dashboard.
+                When a user selects a crisis or country, FastAPI triggers: (1) live Google News fetch for breaking news; (2) vector search in Actian for stored intel (GDACS, HDX, State Dept, HAPI); (3) LLM synthesis (OpenRouter) into a chunked Operational Context Briefing. Resulting briefing and risk context feed the dashboard and tactical analysis views.
             </Step>
 
             <Step order="3" phase="Synthesis" source="modules/synthesis.py (Sphinx)" trigger="State Combination">
@@ -47,7 +47,7 @@
 
         <Track sponsor="Actian" challenge="VectorAI">
             <Component>Safety RAG: Contextual Risk Analysis (VectorAI)</Component>
-            <Integration>Layer 3 Context Engine: ingests GDACS, HDX, US State Dept, HDX HAPI, and Google News; chunks and embeds via OpenRouter; stores in Actian (with auto-recovery on collection corruption); retrieves plus city-specific and nearby-GDACS live data; synthesizes operational field briefings via OpenRouter. Briefings include local situation when coordinates/city are given.</Integration>
+            <Integration>Layer 3 Context Engine: ingests GDACS, HDX, US State Dept, HDX HAPI, and Google News; chunks and embeds via OpenRouter; stores in Actian (with auto-recovery on collection corruption); retrieves plus city-specific and nearby-GDACS live data; synthesizes Operational Context Briefings via OpenRouter. Briefings include local situation when coordinates/city are given.</Integration>
         </Track>
 
         <Track sponsor="Sphinx" challenge="Unique Application">
@@ -68,7 +68,7 @@
                 <Source name="HDX HAPI">Structured data: conflict events (ACLED), food security (IPC); app_identifier required, no API key.</Source>
                 <Source name="Google News RSS">Breaking news (last 7 days); always fetched live at report time; no auth.</Source>
             </DataSources>
-            <Output>Operational field briefing for humanitarian workers: What Changed This Week, Operating Environment, Key Risks, Operational Recommendations. Synthesized via OpenRouter from retrieved chunks and live news. ReliefWeb not used (requires pre-approved app name).</Output>
+            <Output>Operational Context Briefing for humanitarian workers: What Changed This Week, Operating Environment, Key Risks, Operational Recommendations. Synthesized via OpenRouter from retrieved chunks and live news. ReliefWeb not used (requires pre-approved app name).</Output>
         </Layer3>
 
         <Track category="Backend Framework">
@@ -97,7 +97,7 @@
                 <File name="osm_features.py">Layer 2: Advanced OSM feature parsing</File>
                 <File name="vision.py">P2: Satellite CV logic (legacy stub)</File>
                 <File name="vector.py">P2: Delegates safety report to context_engine</File>
-                <File name="context_engine.py">Layer 3: Data ingest (GDACS, HDX CKAN/HAPI, US State Dept, Google News), chunking, OpenRouter embeddings, Actian store (auto-recovery), RAG + city/nearby live data, OpenRouter synthesis for operational briefings</File>
+                <File name="context_engine.py">Layer 3: Data ingest (GDACS, HDX CKAN/HAPI, US State Dept, Google News), chunking, OpenRouter embeddings, Actian store (auto-recovery), RAG + city/nearby live data, OpenRouter synthesis for Operational Context Briefings</File>
                 <File name="synthesis.py">P3: Sphinx Prompting</File>
             </Folder>
             <Folder name="static">

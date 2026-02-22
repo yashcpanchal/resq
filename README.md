@@ -2,9 +2,9 @@
 
 The "Arbitrage" Platform for Humanitarian Aid Allocation. ResQ-Capital identifies underfunded global crises and validates logistical/safety feasibility using vector RAG and operational intelligence.
 
-## Layer 3 — Context Engine (Safety Intelligence)
+### Layer 3 — Context Engine (Operational Context)
 
-The backend provides **operational field briefings** for humanitarian workers deploying to a specific location. Data sources:
+The backend provides **Operational Context Briefings** for humanitarian workers deploying to a specific location. Data sources:
 
 - **GDACS** — Natural disaster alerts (earthquakes, floods, cyclones) + proximity-based nearby alerts
 - **HDX (Humanitarian Data Exchange)** — Country-tagged humanitarian datasets (CKAN + HAPI)
@@ -12,7 +12,10 @@ The backend provides **operational field briefings** for humanitarian workers de
 - **HDX HAPI** — ACLED conflict events, IPC food security by region
 - **Google News RSS** — Breaking news (last 7 days), always fetched live; **city-specific** + country-level
 
-Briefings are synthesized by **OpenRouter LLM** (default: Arcee AI Trinity Large Preview) into: *What Changed This Week* → *Operating Environment* → *Key Risks* → *Local Situation* → *Operational Recommendations*. Aimed at aid workers who are deploying regardless; focus is on how to operate safely, not whether to go.
+Briefings are synthesized by **OpenRouter LLM** (default: Arcee AI Trinity Large Preview) into formatted, actionable chunks: *Local Intelligence* → *Operating Environment* → *Key Risks* → *Operational Recommendations*.
+
+### Tactical Grid & Sector Intelligence
+The Tactical Grid view supports an `?embed=true` parameter for inclusion in side panels (hiding headers/sidebars) and a full-page mode featuring **Sector Intelligence**—a structured breakdown of VLM analysis for each 0.01° grid cell.
 
 ## Layer 2 — Candidate Verification (Vision/Logistics)
 
@@ -59,7 +62,7 @@ Create a `.env` file in the project root (or set in the shell):
 OPENROUTER_API_KEY=your_openrouter_api_key
 ```
 
-Get a key at [OpenRouter Keys](https://openrouter.ai/keys). Used for embeddings and briefing synthesis. Optional overrides: `OPENROUTER_EMBED_MODEL` (default `openai/text-embedding-3-large`), `OPENROUTER_CHAT_MODEL` (default `arcee-ai/trinity-large-preview:free`).
+Get a key at [OpenRouter Keys](https://openrouter.ai/keys). Ensure the key is active and has sufficient quota. Used for embeddings and briefing synthesis. Optional overrides: `OPENROUTER_EMBED_MODEL` (default `openai/text-embedding-3-large`), `OPENROUTER_CHAT_MODEL` (default `arcee-ai/trinity-large-preview:free`).
 
 ### 4. Start the server
 
@@ -75,7 +78,7 @@ Or without activating: `./.venv/Scripts/python -m uvicorn app:app --reload` (Win
 
 ## Test UI and API
 
-- **Test UI (Layer 3):** [http://localhost:8000/test](http://localhost:8000/test) — Enter a country, click **Ingest** to load intelligence into the vector DB, then **Get safety report** for an operational field briefing.
+- **Test UI (Layer 3):** [http://localhost:8000/test](http://localhost:8000/test) — Enter a country, click **Ingest** to load intelligence into the vector DB, then **Get safety report** for an operational context briefing.
 - **Simple docs:** [http://localhost:8000/docs-simple](http://localhost:8000/docs-simple) — Lightweight API reference (no external CDN).
 - **OpenAPI:** [http://localhost:8000/docs](http://localhost:8000/docs) or [http://localhost:8000/redoc](http://localhost:8000/redoc).
 
