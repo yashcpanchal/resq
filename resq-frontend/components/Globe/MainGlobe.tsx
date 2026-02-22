@@ -10,6 +10,7 @@ import { geoCentroid } from "d3-geo";
 import { fetchFundingScores } from "@/lib/api";
 import { scoreToColor, scoreToSideColor } from "@/lib/utils";
 import { m49ToIso3, iso3ToM49 } from "@/lib/countryCodeMap";
+import type { RegionMarker } from "@/data/majorCities";
 
 // react-globe.gl must be client-only (uses WebGL / window)
 const Globe = dynamic(() => import("react-globe.gl"), { ssr: false });
@@ -45,12 +46,18 @@ interface MainGlobeProps {
     focusCountryCode?: string | null;
     onCountryClick?: (country: CountryFeature, score: number) => void;
     onCountryHover?: (country: CountryFeature | null) => void;
+    /** Major cities/regions to show as clickable markers. */
+    regionMarkers?: RegionMarker[];
+    /** Called when a region marker is clicked. */
+    onRegionClick?: (region: RegionMarker) => void;
 }
 
 export default function MainGlobe({
     focusCountryCode,
     onCountryClick,
     onCountryHover,
+    regionMarkers = [],
+    onRegionClick,
 }: MainGlobeProps) {
     const globeRef = useRef<GlobeInstance | undefined>(undefined);
     const [countries, setCountries] = useState<CountryFeature[]>([]);
@@ -261,6 +268,18 @@ export default function MainGlobe({
             polygonsTransitionDuration={300}
             atmosphereColor="#3a7ecf"
             atmosphereAltitude={0.2}
+            pointsData={regionMarkers}
+            pointLat="lat"
+            pointLng="lng"
+            pointLabel={(d: object) => (d as RegionMarker).name}
+            pointColor={() => "rgba(255, 200, 100, 0.9)"}
+            pointAltitude={0.02}
+            pointRadius={0.4}
+            pointsMerge={false}
+            onPointClick={(d: object) => {
+                const r = d as RegionMarker;
+                onRegionClick?.(r);
+            }}
         />
     );
 }

@@ -72,6 +72,18 @@ export default function SidePanel({ country, score, onClose }: SidePanelProps) {
                                     </p>
                                 </div>
 
+                                {/* Humanitarian crises — placeholder until data provided */}
+                                <div className="space-y-3">
+                                    <div className="rounded-lg bg-amber-500/10 border border-amber-500/20 p-3">
+                                        <p className="text-xs text-amber-400/90 uppercase tracking-wider mb-1">
+                                            Current humanitarian crises
+                                        </p>
+                                        <p className="text-sm text-gray-200 leading-relaxed italic">
+                                            Crisis description data will be provided here for {country}. This section will show a short summary of ongoing humanitarian situations (displacement, food insecurity, health emergencies, etc.) in the selected region.
+                                        </p>
+                                    </div>
+                                </div>
+
                                 {/* Info section */}
                                 <div className="space-y-3">
                                     <div className="rounded-lg bg-white/5 p-3">

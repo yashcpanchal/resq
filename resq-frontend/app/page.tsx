@@ -1,13 +1,16 @@
 "use client";
 
-import { useState, useCallback } from "react";
+import { useState, useCallback, useMemo } from "react";
 import dynamic from "next/dynamic";
 import HeatmapLegend from "@/components/Globe/HeatmapLegend";
 import SidePanel from "@/components/Dashboard/SidePanel";
+import LeftPanel from "@/components/Dashboard/LeftPanel";
 import SearchBar from "@/components/Dashboard/SearchBar";
 import { useQuery } from "@tanstack/react-query";
 import { fetchFundingScores } from "@/lib/api";
-import { m49ToIso3 } from "@/lib/countryCodeMap";
+import { m49ToIso3, iso3ToName } from "@/lib/countryCodeMap";
+import { getRegionsForCountry } from "@/data/majorCities";
+import type { RegionMarker } from "@/data/majorCities";
 
 // Globe is heavy + needs window — load only on client
 const MainGlobe = dynamic(() => import("@/components/Globe/MainGlobe"), {
@@ -30,6 +33,11 @@ interface SelectedCountry {
 
 export default function Home() {
   const [selected, setSelected] = useState<SelectedCountry | null>(null);
+  const [selectedRegion, setSelectedRegion] = useState<RegionMarker | null>(null);
+  const regionMarkers = useMemo(
+    () => getRegionsForCountry(selected?.code ?? null),
+    [selected?.code]
+  );
 
   const { data: scores = {} } = useQuery({
     queryKey: ["funding-scores"],
@@ -41,6 +49,7 @@ export default function Home() {
       country: { properties: { name: string;[key: string]: unknown }; id?: string | number },
       score: number
     ) => {
+      setSelectedRegion(null);
       // Map numeric M49 id → ISO-3 code
       const numericId = typeof country.id === "number"
         ? String(country.id).padStart(3, "0")
@@ -57,14 +66,24 @@ export default function Home() {
 
   const handleSearchSelect = useCallback(
     (code: string) => {
+      setSelectedRegion(null);
       setSelected({
-        name: code, // country codes are what we have
+        name: iso3ToName[code] ?? code,
         code,
         score: scores[code] ?? -1,
       });
     },
     [scores]
   );
+
+  const handleRegionClick = useCallback((region: RegionMarker) => {
+    setSelectedRegion(region);
+  }, []);
+
+  const handleCloseLeftPanel = useCallback(() => {
+    setSelected(null);
+    setSelectedRegion(null);
+  }, []);
 
   return (
     <main className="relative h-screen w-screen overflow-hidden bg-gray-950">
@@ -83,9 +102,18 @@ export default function Home() {
       <MainGlobe
         focusCountryCode={selected?.code ?? null}
         onCountryClick={handleCountryClick}
+        regionMarkers={regionMarkers}
+        onRegionClick={handleRegionClick}
       />
 
       <HeatmapLegend />
+
+      <LeftPanel
+        countryName={selected?.name ?? null}
+        selectedRegion={selectedRegion}
+        onClose={handleCloseLeftPanel}
+        onClearRegion={() => setSelectedRegion(null)}
+      />
 
       <SidePanel
         country={selected?.name ?? null}
